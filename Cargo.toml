@@ -50,6 +50,7 @@ ty_ide = { path = "crates/ty_ide" }
 ty_module_resolver = { path = "crates/ty_module_resolver" }
 ty_project = { path = "crates/ty_project", default-features = false }
 ty_python_semantic = { path = "crates/ty_python_semantic" }
+ty_python_core = { path = "crates/ty_python_core" }
 ty_server = { path = "crates/ty_server" }
 ty_site_packages = { path = "crates/ty_site_packages" }
 ty_static = { path = "crates/ty_static" }
@@ -74,7 +75,7 @@ camino = { version = "1.1.7" }
 clap = { version = "4.5.3", features = ["derive"] }
 clap_complete_command = { version = "0.6.0" }
 clearscreen = { version = "4.0.0" }
-codspeed-criterion-compat = { version = "4.0.4", default-features = false }
+codspeed-criterion-compat = { version = "4.4.1", default-features = false }
 colored = { version = "3.0.0" }
 compact_str = "0.9.0"
 console_error_panic_hook = { version = "0.1.7" }
@@ -85,7 +86,7 @@ crossbeam = { version = "0.8.4" }
 csv = { version = "1.3.1" }
 dashmap = { version = "6.0.1" }
 datatest-stable = { version = "0.3.3" }
-divan = { package = "codspeed-divan-compat", version = "4.0.4" }
+divan = { package = "codspeed-divan-compat", version = "4.4.1" }
 drop_bomb = { version = "0.1.5" }
 dunce = { version = "1.0.5" }
 etcetera = { version = "0.11.0" }
@@ -108,8 +109,9 @@ hashbrown = { version = "0.16.0", default-features = false, features = [
     "inline-more",
 ] }
 heck = "0.5.0"
+icu_properties = { version = "2.1.2" }
 ignore = { version = "0.4.24" }
-imara-diff = { version = "0.1.5" }
+imara-diff = { version = "0.2.0" }
 imperative = { version = "1.0.4" }
 indexmap = { version = "2.6.0" }
 indicatif = { version = "0.18.0" }
@@ -169,7 +171,7 @@ serde_with = { version = "3.6.0", default-features = false, features = [
     "macros",
 ] }
 shellexpand = { version = "3.0.0" }
-similar = { version = "2.4.0", features = ["inline"] }
+similar = { version = "3.0.0", features = ["inline"] }
 smallvec = { version = "1.13.2", features = ["union", "const_generics", "const_new"] }
 snapbox = { version = "1.0.0", features = [
     "diff",
@@ -199,7 +201,6 @@ tracing-subscriber = { version = "0.3.18", default-features = false, features = 
 ] }
 tryfn = { version = "1.0.0" }
 typed-arena = { version = "2.0.2" }
-unic-ucd-category = { version = "0.9" }
 unicode-ident = { version = "1.0.12" }
 unicode-normalization = { version = "0.1.23" }
 unicode-width = { version = "0.2.0" }
@@ -216,9 +217,6 @@ zip = { version = "0.6.6", default-features = false }
 [workspace.metadata.cargo-shear]
 ignored = [
     "getrandom",
-    "ruff_options_metadata",
-    "uuid",
-    "get-size2",
     "ty_completion_bench",
     "ty_completion_eval",
 ]

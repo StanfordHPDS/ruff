@@ -14,8 +14,8 @@ def _(
     b: TypeIs[str | int],
     c: TypeGuard[bool],
     d: TypeIs[tuple[TypeOf[bytes]]],
-    e: TypeGuard,  # error: [invalid-type-form] "`typing.TypeGuard` requires exactly one argument when used in a type expression"
-    f: TypeIs,  # error: [invalid-type-form] "`typing.TypeIs` requires exactly one argument when used in a type expression"
+    e: TypeGuard,  # error: [invalid-type-form] "`typing.TypeGuard` requires exactly one argument when used in a parameter annotation"
+    f: TypeIs,  # error: [invalid-type-form] "`typing.TypeIs` requires exactly one argument when used in a parameter annotation"
 ):
     reveal_type(a)  # revealed: TypeGuard[str]
     reveal_type(b)  # revealed: TypeIs[str | int]
@@ -188,7 +188,6 @@ a = 123
 def f(_) -> TypeGuard[int, str]: ...
 
 # error: [invalid-type-form] "Special form `typing.TypeIs` expected exactly one type parameter"
-# error: [invalid-type-form] "Variable of type `Literal[123]` is not allowed in a type expression"
 def g(_) -> TypeIs[a, str]: ...
 
 reveal_type(f(0))  # revealed: Unknown

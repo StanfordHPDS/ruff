@@ -13,8 +13,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tempfile::TempDir;
 use ty_module_resolver::{ModuleGlobSetBuilder, SearchPaths};
+use ty_python_core::program::Program;
 use ty_python_semantic::lint::{LintRegistry, RuleSelection};
-use ty_python_semantic::{AnalysisSettings, Db as SemanticDb, Program, default_lint_registry};
+use ty_python_semantic::{AnalysisSettings, Db as SemanticDb, default_lint_registry};
 
 use crate::config::Analysis;
 
@@ -153,11 +154,14 @@ impl ty_module_resolver::Db for Db {
 }
 
 #[salsa::db]
-impl SemanticDb for Db {
+impl ty_python_core::Db for Db {
     fn should_check_file(&self, file: File) -> bool {
         !file.path(self).is_vendored_path()
     }
+}
 
+#[salsa::db]
+impl SemanticDb for Db {
     fn rule_selection(&self, _file: File) -> &RuleSelection {
         &self.rule_selection
     }
@@ -342,17 +346,6 @@ impl System for MdtestSystem {
         path: &SystemPath,
     ) -> ruff_db::system::walk_directory::WalkDirectoryBuilder {
         self.as_system().walk_directory(&self.normalize_path(path))
-    }
-
-    fn glob(
-        &self,
-        pattern: &str,
-    ) -> Result<
-        Box<dyn Iterator<Item = Result<SystemPathBuf, ruff_db::system::GlobError>> + '_>,
-        ruff_db::system::PatternError,
-    > {
-        self.as_system()
-            .glob(self.normalize_path(SystemPath::new(pattern)).as_str())
     }
 
     fn as_writable(&self) -> Option<&dyn WritableSystem> {

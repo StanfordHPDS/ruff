@@ -8,9 +8,11 @@ use ruff_python_ast::name::Name;
 use ty_module_resolver::{ModuleName, file_to_module};
 
 use super::protocol_class::ProtocolInterface;
-use super::{BoundTypeVarInstance, ClassType, KnownClass, SubclassOfType, Type, TypeVarVariance};
+use super::{
+    BoundTypeVarInstance, ClassType, DivergentType, KnownClass, MaterializationKind,
+    SubclassOfType, Type, TypeVarVariance,
+};
 use crate::place::PlaceAndQualifiers;
-use crate::semantic_index::definition::Definition;
 use crate::types::constraints::{
     ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
 };
@@ -29,6 +31,7 @@ use crate::types::{
 };
 use crate::{Db, FxOrderSet, Program};
 pub(super) use synthesized_protocol::SynthesizedProtocolType;
+use ty_python_core::definition::Definition;
 
 impl<'db> Type<'db> {
     pub(crate) const fn object() -> Self {
@@ -39,20 +42,23 @@ impl<'db> Type<'db> {
         matches!(
             self,
             Type::NominalInstance(NominalInstanceType(NominalInstanceInner::Object))
+                | Type::Divergent(DivergentType {
+                    materialization: Some(MaterializationKind::Top),
+                    ..
+                })
         )
     }
 
     pub(crate) fn instance(db: &'db dyn Db, class: ClassType<'db>) -> Self {
         match class.class_literal(db) {
             // Dynamic classes created via `type()` don't have special instance types.
-            // TODO: When we add functional TypedDict support, this branch should check
-            // for TypedDict and return `Type::typed_dict(class)` for that case.
-            ClassLiteral::Dynamic(_) => {
+            ClassLiteral::Dynamic(_)
+            | ClassLiteral::DynamicNamedTuple(_)
+            | ClassLiteral::DynamicEnum(_) => {
                 Type::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(class)))
             }
-            ClassLiteral::DynamicNamedTuple(_) => {
-                Type::NominalInstance(NominalInstanceType(NominalInstanceInner::NonTuple(class)))
-            }
+            // Functional TypedDicts return a TypedDict instance type.
+            ClassLiteral::DynamicTypedDict(_) => Type::typed_dict(class),
             ClassLiteral::Static(class_literal) => {
                 let specialization = class.into_generic_alias().map(|g| g.specialization(db));
                 match class_literal.known(db) {
@@ -715,11 +721,13 @@ impl<'db> ProtocolInstanceType<'db> {
             let constraints = ConstraintSetBuilder::new();
             let relation_visitor = HasRelationToVisitor::default(&constraints);
             let disjointness_visitor = IsDisjointVisitor::default(&constraints);
+            let materialization_visitor = ApplyTypeMappingVisitor::default();
             let checker = TypeRelationChecker::subtyping(
                 &constraints,
                 InferableTypeVars::None,
                 &relation_visitor,
                 &disjointness_visitor,
+                &materialization_visitor,
             );
             checker
                 .check_type_satisfies_protocol(db, Type::object(), protocol)
@@ -825,6 +833,10 @@ impl<'db> Protocol<'db> {
             )),
         }
     }
+
+    pub(super) const fn is_synthesized(self) -> bool {
+        matches!(self, Self::Synthesized(_))
+    }
 }
 
 impl<'db> VarianceInferable<'db> for Protocol<'db> {
@@ -839,13 +851,13 @@ impl<'db> VarianceInferable<'db> for Protocol<'db> {
 }
 
 mod synthesized_protocol {
-    use crate::semantic_index::definition::Definition;
     use crate::types::protocol_class::ProtocolInterface;
     use crate::types::{
         ApplyTypeMappingVisitor, BoundTypeVarInstance, FindLegacyTypeVarsVisitor, Type,
         TypeContext, TypeMapping, TypeVarVariance, VarianceInferable,
     };
     use crate::{Db, FxOrderSet};
+    use ty_python_core::definition::Definition;
 
     /// A "synthesized" protocol type that is dissociated from a class definition in source code.
     #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]

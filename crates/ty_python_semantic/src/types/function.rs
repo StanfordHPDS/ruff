@@ -60,10 +60,6 @@ use ruff_text_size::Ranged;
 use ty_module_resolver::{KnownModule, ModuleName, file_to_module, resolve_module};
 
 use crate::place::{DefinedPlace, Definedness, Place, place_from_bindings};
-use crate::semantic_index::ast_ids::HasScopedUseId;
-use crate::semantic_index::definition::Definition;
-use crate::semantic_index::scope::ScopeId;
-use crate::semantic_index::{FileScopeId, SemanticIndex, semantic_index};
 use crate::types::call::{Binding, CallArguments};
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::ConstraintSet;
@@ -93,6 +89,10 @@ use crate::types::{
     binding_type, definition_expression_type, infer_definition_types, walk_signature,
 };
 use crate::{Db, FxOrderSet};
+use ty_python_core::ast_ids::HasScopedUseId;
+use ty_python_core::definition::Definition;
+use ty_python_core::scope::ScopeId;
+use ty_python_core::{FileScopeId, SemanticIndex, semantic_index};
 
 /// A collection of useful spans for annotating functions.
 ///
@@ -1446,13 +1446,8 @@ fn is_instance_truthiness<'db>(
     class: ClassLiteral<'db>,
 ) -> Truthiness {
     let is_instance = |ty: &Type<'_>| {
-        ty.as_nominal_instance().is_some_and(|instance| {
-            instance
-                .class(db)
-                .iter_mro(db)
-                .filter_map(ClassBase::into_class)
-                .any(|mro_class| mro_class.class_literal(db) == class)
-        })
+        ty.as_nominal_instance()
+            .is_some_and(|instance| instance.class(db).is_subtype_of_class_literal(db, class))
     };
 
     let always_true_if = |test: bool| {
@@ -1571,6 +1566,7 @@ fn is_instance_truthiness<'db>(
         | Type::TypeGuard(..)
         | Type::Callable(..)
         | Type::Dynamic(..)
+        | Type::Divergent(_)
         | Type::Never
         | Type::TypedDict(_) => {
             // We could probably try to infer more precise types in some of these cases, but it's unclear
@@ -1588,6 +1584,17 @@ fn last_definition_signature_cycle_initial<'db>(
     Signature::bottom()
 }
 
+/// Returns `true` if the function body is stub-like, ignoring a leading docstring.
+pub(crate) fn function_has_stub_body(node: &ast::StmtFunctionDef) -> bool {
+    let suite = ast::helpers::body_without_leading_docstring(&node.body);
+
+    suite.iter().all(|stmt| match stmt {
+        ast::Stmt::Pass(_) => true,
+        ast::Stmt::Expr(ast::StmtExpr { value, .. }) => value.is_ellipsis_literal_expr(),
+        _ => false,
+    })
+}
+
 /// Classify the body of this function:
 /// - [`FunctionBodyKind::Stub`] if it is a stub function (i.e., only contains `pass` or `...`
 /// - [`FunctionBodyKind::AlwaysRaisesNotImplementedError`] if it consists of a single
@@ -1602,19 +1609,9 @@ pub(super) fn function_body_kind<'db>(
     infer_type: impl Fn(&ast::Expr) -> Type<'db>,
 ) -> FunctionBodyKind {
     // Allow docstrings, but only as the first statement.
-    let suite = if let Some(ast::Stmt::Expr(ast::StmtExpr { value, .. })) = node.body.first()
-        && value.is_string_literal_expr()
-    {
-        &node.body[1..]
-    } else {
-        &node.body[..]
-    };
+    let suite = ast::helpers::body_without_leading_docstring(&node.body);
 
-    if suite.iter().all(|stmt| match stmt {
-        ast::Stmt::Pass(_) => true,
-        ast::Stmt::Expr(ast::StmtExpr { value, .. }) => value.is_ellipsis_literal_expr(),
-        _ => false,
-    }) {
+    if function_has_stub_body(node) {
         return FunctionBodyKind::Stub;
     }
 
@@ -1773,6 +1770,8 @@ pub enum KnownFunction {
     RevealMro,
     /// `struct.unpack`
     Unpack,
+    /// `types.new_class`
+    NewClass,
 }
 
 impl KnownFunction {
@@ -1857,6 +1856,9 @@ impl KnownFunction {
             Self::ImportModule => module.is_importlib(),
             Self::Unpack => {
                 matches!(module, KnownModule::Struct)
+            }
+            Self::NewClass => {
+                matches!(module, KnownModule::Types)
             }
 
             Self::TypeCheckOnly => matches!(module, KnownModule::Typing),
@@ -2041,8 +2043,9 @@ impl KnownFunction {
                 let [Some(casted_type), Some(source_type)] = parameter_types else {
                     return;
                 };
-                let contains_unknown_or_todo =
-                    |ty| matches!(ty, Type::Dynamic(dynamic) if dynamic != DynamicType::Any);
+                let contains_unknown_or_todo = |ty: Type<'_>| {
+                    ty.is_dynamic() && !matches!(ty, Type::Dynamic(DynamicType::Any))
+                };
                 if source_type.is_equivalent_to(db, *casted_type)
                     && !any_over_type(db, *source_type, true, contains_unknown_or_todo)
                     && !any_over_type(db, *casted_type, true, contains_unknown_or_todo)
@@ -2204,9 +2207,10 @@ impl KnownFunction {
                 if let Type::ClassLiteral(class) = second_argument
                     && self == KnownFunction::IsInstance
                 {
-                    overload.set_return_type(
-                        is_instance_truthiness(db, *first_arg, *class).into_type(db),
-                    );
+                    overload.set_return_type(Type::from_truthiness(
+                        db,
+                        is_instance_truthiness(db, *first_arg, *class),
+                    ));
                 }
             }
 
@@ -2361,6 +2365,7 @@ pub(crate) mod tests {
                 KnownFunction::NamedTuple => KnownModule::Collections,
                 KnownFunction::TotalOrdering => KnownModule::Functools,
                 KnownFunction::Unpack => KnownModule::Struct,
+                KnownFunction::NewClass => KnownModule::Types,
             };
 
             let function_definition = known_module_symbol(&db, module, function_name)
