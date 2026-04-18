@@ -141,9 +141,7 @@ info: Function defined here
   |
 1 | def foo(
   |     ^^^
-  |
- ::: src/mdtest_snippet.py:3:5
-  |
+2 |     x: int,
 3 |     y: int,
   |     ------ Parameter declared here
   |
@@ -569,6 +567,7 @@ error[invalid-argument-type]: Argument to function `f` is incorrect
 8 |     f(x)  # snapshot: invalid-argument-type
   |       ^ Expected `Number`, found `int | float`
   |
+info: element `int` of union `int | float` is not assignable to `Number`
 info: Function defined here
  --> src/mdtest_snippet.py:3:5
   |

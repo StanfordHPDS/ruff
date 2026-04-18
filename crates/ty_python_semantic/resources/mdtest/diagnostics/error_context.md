@@ -1,12 +1,14 @@
-# Invalid assignment diagnostics
+# Error context for diagnostics involving assignability checks
 
 ```toml
 [environment]
 python-version = "3.12"
 ```
 
-This file contains various scenarios of `invalid-assignment` (and related) diagnostics where we
-(attempt to) do better than just report "type X is not assignable to type Y".
+A lot of ty's diagnostics are emitted as a direct result of a type-to-type assignability check
+(`invalid-assignment`, `invalid-argument-type` or `invalid-method-override`). Types can be complex,
+and so we can often help users understand the incompatibility by focusing on the relevant parts of
+the two types that are being compared.
 
 ## Basic
 
@@ -46,6 +48,7 @@ error[invalid-assignment]: Object of type `str | None` is not assignable to `str
   |             |
   |             Declared type
   |
+info: element `None` of union `str | None` is not assignable to `str`
 ```
 
 Assigning a non-union to a union:
@@ -82,6 +85,7 @@ error[invalid-assignment]: Object of type `str | None` is not assignable to `byt
   |             |
   |             Declared type
   |
+info: element `str` of union `str | None` is not assignable to `bytes | None`
 ```
 
 ## Intersections
@@ -164,6 +168,7 @@ error[invalid-assignment]: Object of type `tuple[int, str, bool]` is not assigna
   |             |
   |             Declared type
   |
+info: the second tuple element is not compatible: `str` is not assignable to `bytes`
 ```
 
 Wrong number of elements:
@@ -182,6 +187,7 @@ error[invalid-assignment]: Object of type `tuple[int, str]` is not assignable to
   |             |
   |             Declared type
   |
+info: a tuple of length 2 is not assignable to a tuple of length 3
 ```
 
 ## `Callable`
@@ -206,6 +212,7 @@ error[invalid-assignment]: Object of type `def source(x: int, y: str) -> None` i
   |         |
   |         Declared type
   |
+info: incompatible return types: `None` is not assignable to `bool`
 ```
 
 Assigning a `Callable` to a `Callable` with wrong parameter type:
@@ -224,6 +231,7 @@ error[invalid-assignment]: Object of type `(int, str, /) -> bool` is not assigna
   |             |
   |             Declared type
   |
+info: the second parameter has an incompatible type: `bytes` is not assignable to `str`
 ```
 
 Assigning a `Callable` to a `Callable` with wrong return type:
@@ -242,6 +250,7 @@ error[invalid-assignment]: Object of type `(int, bytes, /) -> None` is not assig
    |             |
    |             Declared type
    |
+info: incompatible return types: `None` is not assignable to `bool`
 ```
 
 Assigning a `Callable` to a `Callable` with wrong number of parameters:
@@ -280,6 +289,7 @@ error[invalid-assignment]: Object of type `<class 'Number'>` is not assignable t
    |         |
    |         Declared type
    |
+info: the first parameter has an incompatible type: `str` is not assignable to `int`
 ```
 
 ## Function assignability and overrides
@@ -311,6 +321,36 @@ error[invalid-method-override]: Invalid override of method `method`
 2 |     def method(self, x: str) -> bool:
   |         ---------------------------- `Parent.method` defined here
   |
+info: parameter `x` has an incompatible type: `str` is not assignable to `bytes`
+info: This violates the Liskov Substitution Principle
+```
+
+We call out the correct (target) parameter if they are listed in a different order:
+
+```py
+class ParentXY:
+    def method(self, *, x: str, y: int) -> bool:
+        raise NotImplementedError
+
+class ChildYX(ParentXY):
+    # snapshot
+    def method(self, *, y: int, x: bytes) -> bool:
+        raise NotImplementedError
+```
+
+```snapshot
+error[invalid-method-override]: Invalid override of method `method`
+  --> src/mdtest_snippet.py:15:9
+   |
+15 |     def method(self, *, y: int, x: bytes) -> bool:
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Definition is incompatible with `ParentXY.method`
+   |
+  ::: src/mdtest_snippet.py:10:9
+   |
+10 |     def method(self, *, x: str, y: int) -> bool:
+   |         --------------------------------------- `ParentXY.method` defined here
+   |
+info: parameter `x` has an incompatible type: `str` is not assignable to `bytes`
 info: This violates the Liskov Substitution Principle
 ```
 
@@ -325,9 +365,9 @@ class Child2(Parent):
 
 ```snapshot
 error[invalid-method-override]: Invalid override of method `method`
-  --> src/mdtest_snippet.py:11:9
+  --> src/mdtest_snippet.py:19:9
    |
-11 |     def method(self, x: str) -> None:
+19 |     def method(self, x: str) -> None:
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Definition is incompatible with `Parent.method`
    |
   ::: src/mdtest_snippet.py:2:9
@@ -335,6 +375,7 @@ error[invalid-method-override]: Invalid override of method `method`
  2 |     def method(self, x: str) -> bool:
    |         ---------------------------- `Parent.method` defined here
    |
+info: incompatible return types: `None` is not assignable to `bool`
 info: This violates the Liskov Substitution Principle
 ```
 
@@ -349,9 +390,9 @@ class Child3(Parent):
 
 ```snapshot
 error[invalid-method-override]: Invalid override of method `method`
-  --> src/mdtest_snippet.py:15:9
+  --> src/mdtest_snippet.py:23:9
    |
-15 |     def method(self, y: str):
+23 |     def method(self, y: str):
    |         ^^^^^^^^^^^^^^^^^^^^ Definition is incompatible with `Parent.method`
    |
   ::: src/mdtest_snippet.py:2:9
@@ -359,6 +400,7 @@ error[invalid-method-override]: Invalid override of method `method`
  2 |     def method(self, x: str) -> bool:
    |         ---------------------------- `Parent.method` defined here
    |
+info: the parameter named `y` does not match `x` (and can be used as a keyword parameter)
 info: This violates the Liskov Substitution Principle
 ```
 
@@ -431,6 +473,7 @@ error[invalid-assignment]: Object of type `Person` is not assignable to `dict[st
    |             |
    |             Declared type
    |
+info: `TypedDict` types are not assignable to `dict` (consider using `Mapping` instead)
 ```
 
 ## Protocols
@@ -458,6 +501,8 @@ error[invalid-assignment]: Object of type `DoesNotHaveCheck` is not assignable t
   |             |
   |             Declared type
   |
+info: type `DoesNotHaveCheck` is not assignable to protocol `SupportsCheck`
+info: └── protocol member `check` is not defined on type `DoesNotHaveCheck`
 ```
 
 Incompatible types for protocol members:
@@ -480,6 +525,9 @@ error[invalid-assignment]: Object of type `CheckWithWrongSignature` is not assig
    |             |
    |             Declared type
    |
+info: type `CheckWithWrongSignature` is not assignable to protocol `SupportsCheck`
+info: └── protocol member `check` is incompatible
+info:     └── parameter `y` has an incompatible type: `str` is not assignable to `bytes`
 ```
 
 Missing protocol properties:
@@ -504,6 +552,8 @@ error[invalid-assignment]: Object of type `DoesNotHaveName` is not assignable to
    |             |
    |             Declared type
    |
+info: type `DoesNotHaveName` is not assignable to protocol `SupportsName`
+info: └── protocol member `name` is not defined on type `DoesNotHaveName`
 ```
 
 ## Type aliases
@@ -535,6 +585,11 @@ error[invalid-assignment]: Object of type `HasName` is not assignable to `String
    |             |
    |             Declared type
    |
+info: type `HasName` is not assignable to any element of the union `str | SupportsName`
+info: ├── type `HasName` is not assignable to protocol `SupportsName`
+info: │   └── protocol member `name` is incompatible
+info: │       └── incompatible return types: `bytes` is not assignable to `str`
+info: └── ... omitted 1 union element without additional context
 ```
 
 ## Deeply nested incompatibilities
@@ -557,6 +612,8 @@ error[invalid-assignment]: Object of type `def source(x: tuple[int, str]) -> boo
   |         |
   |         Declared type
   |
+info: the first parameter has an incompatible type: `tuple[int, bytes]` is not assignable to `tuple[int, str]`
+info: └── the second tuple element is not compatible: `bytes` is not assignable to `str`
 ```
 
 ## Multiple nested incompatibilities
@@ -585,6 +642,9 @@ error[invalid-assignment]: Object of type `Incompatible` is not assignable to `S
    |             |
    |             Declared type
    |
+info: type `Incompatible` is not assignable to protocol `SupportsCheck`
+info: └── protocol member `check1` is incompatible
+info:     └── parameter `x` has an incompatible type: `str` is not assignable to `bytes`
 ```
 
 ## Failures for multiple union elements
@@ -613,6 +673,11 @@ error[invalid-assignment]: Object of type `HasNeither` is not assignable to `Sup
    |             |
    |             Declared type
    |
+info: type `HasNeither` is not assignable to any element of the union `SupportsFoo | SupportsBar`
+info: ├── type `HasNeither` is not assignable to protocol `SupportsFoo`
+info: │   └── protocol member `foo` is not defined on type `HasNeither`
+info: └── type `HasNeither` is not assignable to protocol `SupportsBar`
+info:     └── protocol member `bar` is not defined on type `HasNeither`
 ```
 
 ## Failures for many union elements
@@ -693,6 +758,9 @@ error[invalid-assignment]: Object of type `IncompatibleFoo` is not assignable to
    |             |
    |             Declared type
    |
+info: type `IncompatibleFoo` is not assignable to protocol `SupportsFooAndBar`
+info: └── protocol member `foo` is incompatible
+info:     └── the parameter named `name_` does not match `name` (and can be used as a keyword parameter)
 ```
 
 ## Assigning to `Iterable`
@@ -713,32 +781,11 @@ error[invalid-assignment]: Object of type `list[str]` is not assignable to `Iter
   |             |
   |             Declared type
   |
-```
-
-## Deleting a read-only property
-
-```py
-class C:
-    @property
-    def attr(self) -> int:
-        return 1
-
-c = C()
-del c.attr  # snapshot
-```
-
-```snapshot
-error[invalid-assignment]: Cannot delete read-only property `attr` on object of type `C`
- --> src/mdtest_snippet.py:7:5
-  |
-7 | del c.attr  # snapshot
-  |     ^^^^^^ Attempted deletion of `C.attr` here
-  |
- ::: src/mdtest_snippet.py:3:9
-  |
-3 |     def attr(self) -> int:
-  |         ---- Property `C.attr` defined here with no deleter
-  |
+info: type `list[str]` is not assignable to protocol `Iterable[bytes]`
+info: └── protocol member `__iter__` is incompatible
+info:     └── incompatible return types: `Iterator[str]` is not assignable to `Iterator[bytes]`
+info:         └── protocol `Iterator[str]` is not assignable to protocol `Iterator[bytes]`
+info:             └── incompatible return types: `str` is not assignable to `bytes`
 ```
 
 ## Invariant generic classes
