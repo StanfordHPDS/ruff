@@ -651,26 +651,21 @@ impl<'db> Bindings<'db> {
             .filter_map(CallableItem::as_constructor_mut)
     }
 
-    fn collect_type_context_callables<'a>(&'a self, out: &mut Vec<&'a CallableBinding<'db>>) {
+    /// Visits the callables that should contribute argument type context, including deferred
+    /// constructor callables that are relevant to the matched upstream constructor path.
+    pub(crate) fn visit_type_context_callables<'a>(
+        &'a self,
+        visit: &mut impl FnMut(&'a CallableBinding<'db>),
+    ) {
         for item in self.iter_callable_items() {
-            out.push(item.callable());
+            visit(item.callable());
 
             if let Some(constructor) = item.as_constructor()
                 && let Some(downstream) = &constructor.downstream_constructor
             {
-                downstream.collect_type_context_callables(out);
+                downstream.visit_type_context_callables(visit);
             }
         }
-    }
-
-    /// Returns the callables that should contribute argument type context, including deferred
-    /// constructor callables that are relevant to the matched upstream constructor path.
-    pub(crate) fn iter_type_context_callables(
-        &self,
-    ) -> impl Iterator<Item = &CallableBinding<'db>> + '_ {
-        let mut callables = Vec::new();
-        self.collect_type_context_callables(&mut callables);
-        callables.into_iter()
     }
 
     /// Returns `true` if every element of the union contains an intersection element with a matching
@@ -4237,8 +4232,6 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         return_ty: Type<'db>,
         errors: &'a mut Vec<BindingError<'db>>,
     ) -> Self {
-        let parameter_count = parameter_tys.len();
-
         Self {
             db,
             signature_type,
@@ -4246,9 +4239,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             arguments,
             argument_matches,
             parameter_tys,
-            parameter_ty_builders: std::iter::repeat_with(|| None)
-                .take(parameter_count)
-                .collect(),
+            parameter_ty_builders: Vec::new(),
             call_expression_tcx,
             return_ty,
             errors,
@@ -4611,12 +4602,21 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         }
         // We still update the actual type of the parameter in this binding to match the argument,
         // even if the argument type is not assignable to the expected parameter type.
-        if let Some(builder) = &mut self.parameter_ty_builders[parameter_index] {
+        if let Some(builder) = self
+            .parameter_ty_builders
+            .get_mut(parameter_index)
+            .and_then(Option::as_mut)
+        {
             builder.add_in_place(argument_type);
         } else if let Some(existing) = self.parameter_tys[parameter_index] {
             let mut builder = UnionBuilder::new(self.db);
             builder.add_in_place(existing);
             builder.add_in_place(argument_type);
+            if self.parameter_ty_builders.is_empty() {
+                self.parameter_ty_builders = std::iter::repeat_with(|| None)
+                    .take(self.parameter_tys.len())
+                    .collect();
+            }
             self.parameter_ty_builders[parameter_index] = Some(builder);
         } else {
             self.parameter_tys[parameter_index] = Some(argument_type);

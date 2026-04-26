@@ -337,9 +337,7 @@ impl<'db> GenericContext<'db> {
             NodeWithScopeKind::Function(function) => {
                 let definition = index.expect_single_definition(function);
                 infer_definition_types(db, definition)
-                    .undecorated_type()
-                    .expect("function should have undecorated type")
-                    .as_function_literal()?
+                    .function_type(definition)?
                     .last_definition_signature(db)
                     .generic_context
             }
@@ -2363,6 +2361,19 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         return Ok(());
                     }
                 }
+            }
+
+            // TODO: in principle this could be a generalized Union-actual arm that maps over the
+            // union, but the old solver isn't well-equipped to handle that (due to side effects
+            // from even failed matches), so for now we handle this particular case.
+            (formal @ Type::ProtocolInstance(_), actual @ Type::Union(_)) => {
+                let when =
+                    actual.when_constraint_set_assignable_to(self.db, formal, self.constraints);
+                // For protocol inference via constraint sets, keep unsatisfiable results non-fatal
+                // for now, matching the protocol constraint-set path in the nominal-instance
+                // arm above.
+                let _ = self.add_type_mappings_from_constraint_set(formal, when, &mut f);
+                return Ok(());
             }
 
             // When the formal type is a protocol with a `__call__` method, infer the specialization
