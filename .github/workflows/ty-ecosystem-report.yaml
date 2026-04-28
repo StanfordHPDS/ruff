@@ -18,6 +18,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTUP_MAX_RETRIES: 10
   RUST_BACKTRACE: 1
+  # Line-tables-only debug info: faster builds, backtraces still work.
+  CARGO_PROFILE_PROFILING_DEBUG: line-tables-only
 
 jobs:
   ty-ecosystem-report:
@@ -28,8 +30,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: ruff
-          fetch-depth: 0
           persist-credentials: false
+
+      # Faster to do this separately than to use `fetch-depth: 0` with `actions/checkout`
+      - name: Fetch full history without tags
+        run: git -C ruff fetch --no-tags --filter=blob:none --unshallow origin
 
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -44,6 +49,9 @@ jobs:
 
       - name: Install Rust toolchain
         run: rustup show
+
+      - name: "Install mold"
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
 
       - name: Create report
         shell: bash
