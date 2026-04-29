@@ -55,7 +55,8 @@ use crate::types::{
     DataclassFlags, DataclassParams, GenericAlias, InternedConstraintSet, IntersectionType,
     KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueTypeKind, NominalInstanceType,
     PropertyInstanceType, SpecialFormType, TypeAliasType, TypeContext, TypeVarBoundOrConstraints,
-    TypeVarVariance, UnionBuilder, UnionType, WrapperDescriptorKind, enums, list_members,
+    TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums,
+    list_members,
 };
 use crate::{DisplaySettings, FxOrderSet, Program};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
@@ -879,7 +880,9 @@ impl<'db> Bindings<'db> {
         call_arguments: &'a CallArguments<'a, 'db>,
         argument_index: usize,
     ) -> Type<'db> {
-        let argument_types = &call_arguments.types()[argument_index];
+        let argument_types = call_arguments
+            .argument_types(argument_index)
+            .expect("argument index should be valid");
 
         // If there is a single matching parameter, return the argument type inferred against
         // its declared type.
@@ -3033,7 +3036,7 @@ impl<'db> CallableBinding<'db> {
                 let slots = overload
                     .argument_matches
                     .iter()
-                    .zip(arguments.types())
+                    .zip(arguments.iter_types())
                     .flat_map(move |(matched_argument, argument_types)| {
                         matched_argument.iter().map(
                             move |(parameter_index, variadic_argument_type)| {
@@ -4324,29 +4327,30 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 let return_ty =
                     return_ty.filter_disjoint_elements(self.db, tcx, self.inferable_typevars);
                 let tcx = tcx.filter_disjoint_elements(self.db, return_ty, self.inferable_typevars);
-                let set = return_ty
-                    .when_constraint_set_assignable_to(self.db, tcx, constraints)
-                    .remove_noninferable(self.db, constraints, self.inferable_typevars);
+                let path_bounds = return_ty.assignable_solutions_with_inferable(
+                    self.db,
+                    tcx,
+                    self.inferable_typevars,
+                );
 
                 // Use `solutions_with` to determine per-typevar variance from the raw
                 // lower/upper bounds on each BDD path.
                 let mut variance_map: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
                     FxHashMap::default();
-                let solutions =
-                    set.solutions_with(self.db, constraints, |typevar, variance, lower, upper| {
-                        let identity = typevar.identity(self.db);
-                        variance_map
-                            .entry(identity)
-                            .and_modify(|current| *current = current.join(variance))
-                            .or_insert(variance);
-                        PathBounds::default_solve(self.db, constraints, typevar, lower, upper)
-                    });
+                let solutions = path_bounds.solve_with(|typevar, variance, lower, upper| {
+                    let identity = typevar.identity(self.db);
+                    variance_map
+                        .entry(identity)
+                        .and_modify(|current| *current = current.join(variance))
+                        .or_insert(variance);
+                    PathBounds::default_solve(self.db, constraints, typevar, lower, upper)
+                });
 
                 let Solutions::Constrained(solutions) = solutions else {
                     return None;
                 };
 
-                let mut preferred: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
+                let mut preferred: FxHashMap<BoundTypeVarIdentity<'db>, UnionAccumulator<'db>> =
                     FxHashMap::default();
 
                 for solution in &solutions {
@@ -4390,13 +4394,15 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
                         preferred
                             .entry(identity)
-                            .and_modify(|existing| {
-                                *existing =
-                                    UnionType::from_two_elements(self.db, *existing, inferred_ty);
-                            })
-                            .or_insert(inferred_ty);
+                            .and_modify(|existing| existing.add(self.db, inferred_ty))
+                            .or_insert_with(|| UnionAccumulator::new(inferred_ty));
                     }
                 }
+
+                let preferred: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> = preferred
+                    .into_iter()
+                    .map(|(identity, accumulator)| (identity, accumulator.into_type(self.db)))
+                    .collect();
 
                 // Add preferred types to the builder so they serve as the base mapping
                 // when argument inference adds more types.
