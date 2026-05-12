@@ -24,7 +24,7 @@ use ty_python_core::statement::StatementInner;
 
 use super::{
     DefinitionInference, DefinitionInferenceExtra, ExpressionInference, ExpressionInferenceExtra,
-    FunctionDecoratorInference, InferenceRegion, ScopeInference, ScopeInferenceExtra,
+    FrozenMap, FunctionDecoratorInference, InferenceRegion, ScopeInference, ScopeInferenceExtra,
     infer_deferred_types, infer_definition_types, infer_expression_types,
     infer_same_file_expression_type, infer_unpack_types,
 };
@@ -83,7 +83,7 @@ use crate::types::infer::{
 use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::newtype::NewType;
 use crate::types::set_theoretic::RecursivelyDefined;
-use crate::types::signatures::CallableSignature;
+use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope};
 use crate::types::special_form::TypeQualifier;
 use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
@@ -391,7 +391,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         #[cfg(debug_assertions)]
         assert_eq!(self.scope, inference.scope);
 
-        self.expressions.extend(inference.expressions.iter());
+        self.expressions
+            .extend(inference.expressions.iter().copied());
         self.declarations.extend(inference.declarations());
 
         if !matches!(self.region, InferenceRegion::Scope(..)) {
@@ -423,7 +424,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         #[cfg(debug_assertions)]
         assert_eq!(self.scope, inference.scope);
 
-        self.expressions.extend(inference.expressions.iter());
+        self.expressions
+            .extend(inference.expressions.iter().copied());
         self.declarations.extend(inference.declarations());
 
         if !matches!(self.region, InferenceRegion::Scope(..)) {
@@ -453,7 +455,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn extend_expression_unchecked(&mut self, inference: &ExpressionInference<'db>) {
-        self.expressions.extend(inference.expressions.iter());
+        self.expressions
+            .extend(inference.expressions.iter().copied());
 
         if let Some(extra) = &inference.extra {
             self.context.extend(&extra.diagnostics);
@@ -471,7 +474,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn extend_scope(&mut self, inference: &ScopeInference<'db>) {
-        self.expressions.extend(inference.expressions.iter());
+        self.expressions
+            .extend(inference.expressions.iter().copied());
 
         if let Some(extra) = &inference.extra {
             self.context.extend(&extra.diagnostics);
@@ -2752,6 +2756,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     infer_value_ty(self, TypeContext::default());
                     return true;
                 };
+                let Some(class_attr_self_ty) = object_ty.to_instance(db) else {
+                    infer_value_ty(self, TypeContext::default());
+                    return true;
+                };
 
                 match meta_attr {
                     PlaceAndQualifiers {
@@ -2836,6 +2844,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 ..
                             } = fallback_attr
                             {
+                                let class_attr_ty =
+                                    class_attr_ty.bind_self_typevars(db, class_attr_self_ty);
                                 let value_ty = infer_value_ty
                                     .infer_silent(self, TypeContext::new(Some(class_attr_ty)));
                                 (
@@ -2876,6 +2886,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             qualifiers,
                         }) = fallback_attr
                         {
+                            let class_attr_ty =
+                                class_attr_ty.bind_self_typevars(db, class_attr_self_ty);
                             let value_ty =
                                 infer_value_ty(self, TypeContext::new(Some(class_attr_ty)));
                             if emit_diagnostics
@@ -4642,7 +4654,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // the expected type passed should be the "raw" type,
                     // i.e. type variables in the return type are non-inferable,
                     // and the return types of async functions are not wrapped in `CoroutineType[...]`.
-                    let return_ty = func.last_definition_raw_signature(self.db()).return_ty;
+                    let return_ty = func
+                        .last_definition_raw_signature(
+                            self.db(),
+                            ReturnCallableTypeVarScope::Lexical,
+                        )
+                        .return_ty;
 
                     // For generator functions, the declared return type is e.g.
                     // `Generator[YieldType, SendType, ReturnType]`. The type context
@@ -7642,7 +7659,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return Type::unknown();
         };
         let declared_return_ty = enclosing_function
-            .last_definition_raw_signature(self.db())
+            .last_definition_raw_signature(self.db(), ReturnCallableTypeVarScope::Public)
             .return_ty;
         let return_type_span = enclosing_function.spans(self.db()).return_type;
 
@@ -7690,7 +7707,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return Type::unknown();
         };
         let annotated_return_ty = enclosing_function
-            .last_definition_raw_signature(self.db())
+            .last_definition_raw_signature(self.db(), ReturnCallableTypeVarScope::Public)
             .return_ty;
 
         let Some(outer_expected) = annotated_return_ty.generator_types(self.db()) else {
@@ -9198,7 +9215,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let Self {
             context,
-            mut expressions,
+            expressions,
             qualifiers: _,
             mut type_expression_flags,
             mut string_annotations,
@@ -9263,10 +9280,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 })
             });
 
-        expressions.shrink_to_fit();
-
         ExpressionInference {
-            expressions,
+            expressions: FrozenMap::from(expressions),
             extra,
             #[cfg(debug_assertions)]
             scope,
@@ -9278,7 +9293,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let Self {
             context,
-            mut expressions,
+            expressions,
             mut qualifiers,
             mut type_expression_flags,
             mut string_annotations,
@@ -9350,10 +9365,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
         }
 
-        expressions.shrink_to_fit();
-
         StatementInferenceInner {
-            expressions,
+            expressions: FrozenMap::from(expressions),
             #[cfg(debug_assertions)]
             scope,
             bindings: bindings.into_boxed_slice(),
@@ -9409,7 +9422,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let diagnostics = context.finish();
 
         FunctionDecoratorInference {
-            expression_types: expressions,
+            expression_types: FrozenMap::from(expressions),
             bindings: bindings.into_boxed_slice(),
             called_functions: called_functions
                 .into_iter()
@@ -9425,7 +9438,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let Self {
             context,
-            mut expressions,
+            expressions,
             mut qualifiers,
             mut type_expression_flags,
             mut string_annotations,
@@ -9497,10 +9510,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
         }
 
-        expressions.shrink_to_fit();
-
         DefinitionInference {
-            expressions,
+            expressions: FrozenMap::from(expressions),
             #[cfg(debug_assertions)]
             scope,
             bindings: bindings.into_boxed_slice(),
@@ -9517,7 +9528,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             mut string_annotations,
             mut expected_types,
             mut type_expression_flags,
-            mut expressions,
+            expressions,
             scope,
             cycle_recovery,
 
@@ -9562,9 +9573,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             })
         });
 
-        expressions.shrink_to_fit();
-
-        ScopeInference { expressions, extra }
+        ScopeInference {
+            expressions: FrozenMap::from(expressions),
+            extra,
+        }
     }
 
     const fn inference_flags(&self) -> InferenceFlags {
