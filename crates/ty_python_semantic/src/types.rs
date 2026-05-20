@@ -1411,6 +1411,7 @@ impl<'db> Type<'db> {
         }
     }
 
+    #[cfg(test)]
     #[track_caller]
     pub(crate) const fn expect_class_literal(self) -> ClassLiteral<'db> {
         self.as_class_literal()
@@ -2044,9 +2045,7 @@ impl<'db> Type<'db> {
             }
             Type::TypeAlias(_) => Some(self),
             Type::NewTypeInstance(newtype) => newtype
-                .try_map_base_class_type(db, |class_type| {
-                    class_type.recursive_type_normalized_impl(db, div, nested)
-                })
+                .recursive_type_normalized_impl(db, div, nested)
                 .map(Type::NewTypeInstance),
             Type::AlwaysFalsy
             | Type::AlwaysTruthy
