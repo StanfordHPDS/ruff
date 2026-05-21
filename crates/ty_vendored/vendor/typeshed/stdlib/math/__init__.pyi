@@ -5,8 +5,7 @@ defined by the C standard.
 import sys
 from _typeshed import SupportsMul, SupportsRMul
 from collections.abc import Iterable
-from typing import Any, Final, Literal, Protocol, SupportsFloat, SupportsIndex, TypeVar, overload, type_check_only
-from typing_extensions import TypeAlias
+from typing import Any, Final, Literal, Protocol, SupportsFloat, SupportsIndex, TypeAlias, TypeVar, overload, type_check_only
 
 _T = TypeVar("_T")
 _T_co = TypeVar("_T_co", covariant=True)
@@ -66,9 +65,9 @@ def ceil(x: _SupportsCeil[_T], /) -> _T:
 
     This is the smallest integer >= x.
     """
-
 @overload
 def ceil(x: _SupportsFloatOrIndex, /) -> int: ...
+
 def comb(n: SupportsIndex, k: SupportsIndex, /) -> int:
     """Number of ways to choose k items from n items without repetition and without order.
 
@@ -144,14 +143,18 @@ def floor(x: _SupportsFloor[_T], /) -> _T:
 
     This is the largest integer <= x.
     """
-
 @overload
 def floor(x: _SupportsFloatOrIndex, /) -> int: ...
+
 def fmod(x: _SupportsFloatOrIndex, y: _SupportsFloatOrIndex, /) -> float:
     """Return fmod(x, y), according to platform C.
 
     x % y may differ.
     """
+
+if sys.version_info >= (3, 15):
+    def fmax(x: _SupportsFloatOrIndex, y: _SupportsFloatOrIndex, /) -> float: ...
+    def fmin(x: _SupportsFloatOrIndex, y: _SupportsFloatOrIndex, /) -> float: ...
 
 def frexp(x: _SupportsFloatOrIndex, /) -> tuple[float, int]:
     """Return the mantissa and exponent of x, as pair (m, e).
@@ -221,6 +224,10 @@ def isfinite(x: _SupportsFloatOrIndex, /) -> bool:
 
 def isnan(x: _SupportsFloatOrIndex, /) -> bool:
     """Return True if x is a NaN (not a number), and False otherwise."""
+
+if sys.version_info >= (3, 15):
+    def isnormal(x: _SupportsFloatOrIndex, /) -> bool: ...
+    def issubnormal(x: _SupportsFloatOrIndex, /) -> bool: ...
 
 def isqrt(n: SupportsIndex, /) -> int:
     """Return the integer part of the square root of the input."""
@@ -319,11 +326,11 @@ def prod(iterable: Iterable[bool | _LiteralInteger], /, *, start: int = 1) -> in
     intended specifically for use with numeric values and may reject
     non-numeric types.
     """
-
 @overload
 def prod(iterable: Iterable[_SupportsProdNoDefaultT], /) -> _SupportsProdNoDefaultT | Literal[1]: ...
 @overload
 def prod(iterable: Iterable[_MultiplicableT1], /, *, start: _MultiplicableT2) -> _MultiplicableT1 | _MultiplicableT2: ...
+
 def radians(x: _SupportsFloatOrIndex, /) -> float:
     """Convert angle x from degrees to radians."""
 
@@ -337,6 +344,9 @@ def remainder(x: _SupportsFloatOrIndex, y: _SupportsFloatOrIndex, /) -> float:
 
 def sin(x: _SupportsFloatOrIndex, /) -> float:
     """Return the sine of x (measured in radians)."""
+
+if sys.version_info >= (3, 15):
+    def signbit(x: _SupportsFloatOrIndex, /) -> bool: ...
 
 def sinh(x: _SupportsFloatOrIndex, /) -> float:
     """Return the hyperbolic sine of x."""
