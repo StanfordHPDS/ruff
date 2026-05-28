@@ -137,6 +137,7 @@ mod post_inference;
 mod subscript;
 mod type_call;
 mod type_expression;
+mod type_form;
 mod typed_dict;
 mod typevar;
 
@@ -1557,6 +1558,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .map(|node_ref| node_ref.node(self.module()))
     }
 
+    fn function_type(&self, function: &ast::StmtFunctionDef) -> Option<FunctionType<'db>> {
+        let definition = self.index.expect_single_definition(function);
+        infer_definition_types(self.db(), definition).function_type(definition)
+    }
+
+    fn current_function_type(&self) -> Option<FunctionType<'db>> {
+        self.function_type(self.current_function_definition()?)
+    }
+
     fn function_decorator_types<'a>(
         &'a self,
         function: &'a ast::StmtFunctionDef,
@@ -2355,7 +2365,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 if !assignable && emit_diagnostics {
                     report_invalid_attribute_assignment(
                         &builder.context,
-                        target.into(),
+                        target.range(),
                         attr_ty,
                         value_ty,
                         attribute,
@@ -2526,6 +2536,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             | Type::AlwaysFalsy
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
+            | Type::TypeForm(_)
             | Type::TypedDict(_)
             | Type::NewTypeInstance(_) => {
                 // We may infer the value type multiple times with distinct type context during
@@ -3040,7 +3051,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         if emit_diagnostics {
                             report_invalid_attribute_assignment(
                                 &self.context,
-                                target.into(),
+                                target.range(),
                                 attr_ty,
                                 value_ty,
                                 attribute,
@@ -3144,6 +3155,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             | Type::AlwaysFalsy
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
+            | Type::TypeForm(_)
             | Type::TypedDict(_)
             | Type::NewTypeInstance(_) => {
                 let delattr_dunder_call_result = object_ty.try_call_dunder_with_policy(
@@ -3306,12 +3318,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 | Type::AlwaysFalsy
                 | Type::TypeIs(_)
                 | Type::TypeGuard(_)
+                | Type::TypeForm(_)
                 | Type::TypedDict(_)
                 | Type::NewTypeInstance(_) => object_ty.instance_member(db, attribute),
                 Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..) => {
-                    object_ty.find_name_in_mro(db, attribute).expect(
-                        "called on Type::ClassLiteral, Type::GenericAlias, or Type::SubclassOf",
-                    )
+                    object_ty.class_object_member(db, attribute, MemberLookupPolicy::default())
                 }
                 Type::Union(..)
                 | Type::Intersection(..)
@@ -4098,6 +4109,49 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         ));
                     }
                 }
+            }
+
+            // Disallow annotations on non-name targets unless they are valid receivers (e.g.
+            // `self.x: int` or `cls.x: int`).
+            let is_receiver_attribute = target
+                .as_attribute_expr()
+                .is_some_and(|target| self.is_receiver_attribute_annotation_target(target));
+            if !is_receiver_attribute {
+                let message = match target.as_ref() {
+                    ast::Expr::Attribute(_) => {
+                        "Type annotations are not allowed on this attribute expression"
+                    }
+                    ast::Expr::Subscript(_) => {
+                        "Type annotations are not allowed on subscripted expressions"
+                    }
+                    _ => {
+                        // For parser-recovered invalid targets, the syntax diagnostic is
+                        // sufficient.
+                        if let Some(value) = value {
+                            self.infer_maybe_standalone_expression(value, TypeContext::default());
+                        }
+                        self.infer_expression(target, TypeContext::default());
+                        return;
+                    }
+                };
+
+                // For syntactically valid non-name targets, reject the annotation and validate
+                // any accompanying assignment.
+                if let Some(builder) = self
+                    .context
+                    .report_lint(&INVALID_TYPE_FORM, annotation.as_ref())
+                {
+                    builder.into_diagnostic(message);
+                }
+
+                if let Some(value) = value {
+                    self.infer_target(target, value, &|builder, tcx| {
+                        builder.infer_maybe_standalone_expression(value, tcx)
+                    });
+                } else {
+                    self.infer_expression(target, TypeContext::default());
+                }
+                return;
             }
 
             let value_ty = value.as_ref().map(|value| {
@@ -5069,6 +5123,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 | Type::BoundSuper(_)
                 | Type::TypeIs(_)
                 | Type::TypeGuard(_)
+                | Type::TypeForm(_)
                 | Type::TypedDict(_)
                 | Type::NewTypeInstance(_) => None,
             }
@@ -5666,6 +5721,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return ty;
         }
 
+        if let Some(target) = tcx.annotation
+            && let Some(ty) = self.infer_type_form_contextual_expression(expression, target)
+        {
+            self.store_expression_type(expression, ty);
+
+            if let Some(expression_cache) = &self.expression_cache {
+                expression_cache
+                    .borrow_mut()
+                    .insert((expression.into(), tcx), ty);
+            }
+
+            return ty;
+        }
+
+        self.infer_value_expression_impl(expression, tcx)
+    }
+
+    /// Infer an expression without implicitly treating this root as a `TypeForm`.
+    ///
+    /// Child expressions still use their normal contextual inference, so the
+    /// expression's existing bidirectional behavior is preserved.
+    fn infer_value_expression_impl(
+        &mut self,
+        expression: &ast::Expr,
+        tcx: TypeContext<'db>,
+    ) -> Type<'db> {
         let mut ty = match expression {
             ast::Expr::NoneLiteral(ast::ExprNoneLiteral {
                 range: _,
@@ -7680,6 +7761,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return self.infer_typeddict_call_expression(call_expression, None);
         }
 
+        if callable_type == Type::SpecialForm(SpecialFormType::TypeForm) {
+            return self.infer_type_form_call_expression(call_expression);
+        }
+
         if callable_type.is_notimplemented(self.db()) {
             if let Some(builder) = self
                 .context
@@ -8930,9 +9015,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let first_parameter_name = first_parameter.name();
 
-        let function_definition = self.index.expect_single_definition(current_function);
-        let Type::FunctionLiteral(function_type) = binding_type(self.db(), function_definition)
-        else {
+        let Some(function_type) = self.current_function_type() else {
             return;
         };
 
@@ -9564,6 +9647,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 | Type::BoundSuper(_)
                 | Type::TypeIs(_)
                 | Type::TypeGuard(_)
+                | Type::TypeForm(_)
                 | Type::TypedDict(_)
                 | Type::NewTypeInstance(_),
             ) => fallback_unary_expression_type(),

@@ -232,11 +232,13 @@ pub(crate) enum InferableTypeVars<'db> {
 impl<'db> InferableTypeVars<'db> {
     pub(crate) fn from_typevars(
         db: &'db dyn Db,
-        typevars: FxOrderSet<BoundTypeVarIdentity<'db>>,
+        mut typevars: FxOrderSet<BoundTypeVarIdentity<'db>>,
     ) -> Self {
         if typevars.is_empty() {
             return InferableTypeVars::None;
         }
+
+        typevars.shrink_to_fit();
         Self::Some(InferableTypeVarsInner::new_internal(db, typevars))
     }
 }
@@ -2276,6 +2278,57 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             // This is necessary for solving generics like `def head[T](my_list: MyList[T]) -> T`.
             (Type::TypeAlias(alias), _) => {
                 return self.infer_map_impl(alias.value_type(self.db), actual, polarity, seen);
+            }
+
+            (Type::TypeForm(formal_typeform), Type::TypeForm(actual_typeform)) => {
+                let variance = TypeVarVariance::Covariant.compose(polarity);
+                return self.infer_map_impl(
+                    formal_typeform.type_argument(self.db),
+                    actual_typeform.type_argument(self.db),
+                    variance,
+                    seen,
+                );
+            }
+
+            (
+                Type::TypeForm(formal_typeform),
+                actual @ (Type::ClassLiteral(_) | Type::GenericAlias(_) | Type::SubclassOf(_)),
+            ) => {
+                let variance = TypeVarVariance::Covariant.compose(polarity);
+                if let Some(actual_instance) = actual.to_instance(self.db) {
+                    return self.infer_map_impl(
+                        formal_typeform.type_argument(self.db),
+                        actual_instance,
+                        variance,
+                        seen,
+                    );
+                }
+            }
+
+            (Type::TypeForm(formal_typeform), Type::KnownInstance(actual_instance))
+                if actual_instance.is_type_form_value() =>
+            {
+                let variance = TypeVarVariance::Covariant.compose(polarity);
+                if let Some(actual_argument) = actual_instance.type_form_argument(self.db) {
+                    return self.infer_map_impl(
+                        formal_typeform.type_argument(self.db),
+                        actual_argument,
+                        variance,
+                        seen,
+                    );
+                }
+            }
+
+            (Type::TypeForm(formal_typeform), Type::SpecialForm(actual_form)) => {
+                let variance = TypeVarVariance::Covariant.compose(polarity);
+                if let Some(actual_argument) = actual_form.type_form_argument(self.db) {
+                    return self.infer_map_impl(
+                        formal_typeform.type_argument(self.db),
+                        actual_argument,
+                        variance,
+                        seen,
+                    );
+                }
             }
 
             // TODO: We haven't implemented a full unification solver yet. If typevars appear in
