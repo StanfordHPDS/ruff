@@ -11,7 +11,7 @@ use crate::reachability::{ReachabilityConstraintsExtension, evaluate_reachabilit
 use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::{
     DynamicType, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers, TypeQualifiers,
-    UnionBuilder, UnionType, binding_type, declaration_type, is_discarded_dict_key_assignment,
+    UnionBuilder, UnionType, binding_type, inferred_declaration, is_discarded_dict_key_assignment,
 };
 use crate::{Db, FxIndexSet, FxOrderSet, Program};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
@@ -1145,14 +1145,21 @@ fn symbol_impl<'db>(
         file_to_module(db, scope.file(db)).is_some_and(|module| module.is_known(db, known_module))
     };
 
-    if name == "platform" && is_known_module(KnownModule::Sys) {
-        match Program::get(db).python_platform(db) {
-            crate::PythonPlatform::Identifier(platform) => {
-                return Place::bound(Type::string_literal(db, platform.as_str())).into();
+    // Check the symbol name first to avoid a module-resolution query for every symbol lookup.
+    if matches!(name, "version_info" | "platform") && is_known_module(KnownModule::Sys) {
+        match name {
+            "version_info" => {
+                return Place::bound(Type::sys_version_info()).into();
             }
-            crate::PythonPlatform::All => {
-                // Fall through to the looked up type
-            }
+            "platform" => match Program::get(db).python_platform(db) {
+                crate::PythonPlatform::Identifier(platform) => {
+                    return Place::bound(Type::string_literal(db, platform.as_str())).into();
+                }
+                crate::PythonPlatform::All => {
+                    // Fall through to the looked up type
+                }
+            },
+            _ => {}
         }
     }
 
@@ -1727,11 +1734,12 @@ fn place_from_declarations_impl<'db>(
         if static_reachability.is_always_false() {
             None
         } else {
+            let declared_type = inferred_declaration(db, declaration).declared()?;
             first_declaration.get_or_insert(declaration);
             all_declarations_definitely_reachable =
                 all_declarations_definitely_reachable && static_reachability.is_always_true();
 
-            Some((declaration_type(db, declaration), static_reachability))
+            Some((declared_type, static_reachability))
         }
     });
 

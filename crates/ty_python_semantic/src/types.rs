@@ -27,8 +27,8 @@ pub(crate) use self::cyclic::TypeTransformer;
 pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{TypeCheckDiagnostics, UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};
 pub(crate) use self::infer::{
-    TypeContext, infer_complete_scope_types, infer_deferred_types, infer_definition_types,
-    infer_expression_type, infer_expression_types, infer_scope_types,
+    InferredDeclaration, TypeContext, infer_complete_scope_types, infer_deferred_types,
+    infer_definition_types, infer_expression_type, infer_expression_types, infer_scope_types,
     is_discarded_dict_key_assignment,
 };
 pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
@@ -80,7 +80,7 @@ pub(crate) use crate::types::signatures::{Parameter, Parameters};
 use crate::types::signatures::{ParameterForm, walk_signature};
 use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::TupleSpec;
-use crate::types::type_alias::TypeAliasType;
+pub use crate::types::type_alias::TypeAliasType;
 pub(crate) use crate::types::typed_dict::TypedDictType;
 use crate::types::typevar::TypeVarInstance;
 pub use crate::types::typevar::{
@@ -203,13 +203,13 @@ pub(crate) fn binding_type<'db>(db: &'db dyn Db, definition: Definition<'db>) ->
     inference.binding_type(definition)
 }
 
-/// Infer the type of a declaration.
-pub(crate) fn declaration_type<'db>(
+/// Infer the type of a declaration, returning `Rejected` if it is not valid.
+pub(crate) fn inferred_declaration<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
-) -> TypeAndQualifiers<'db> {
+) -> InferredDeclaration<'db> {
     let inference = infer_definition_types(db, definition);
-    inference.declaration_type(definition)
+    inference.inferred_declaration(definition)
 }
 
 /// Infer the type of a (possibly deferred) sub-expression of a [`Definition`].
@@ -2625,6 +2625,32 @@ impl<'db> Type<'db> {
                 ..
             }) => self.instance_member(db, &name),
 
+            Type::LiteralValue(literal) if name == "__len__" => {
+                if let Some(length) = match literal.kind() {
+                    LiteralValueTypeKind::Bytes(bytes) => Some(bytes.python_len(db)),
+                    LiteralValueTypeKind::String(string) => Some(string.python_len(db)),
+                    _ => None,
+                } && let Ok(length) = i64::try_from(length)
+                {
+                    let parameters = Parameters::new(
+                        db,
+                        [Parameter::positional_only(Some(Name::new_static("self")))
+                            .with_annotated_type(self)],
+                    );
+                    Place::bound(Type::function_like_callable(
+                        db,
+                        Signature::new(parameters, Type::int_literal(length)),
+                    ))
+                    .into()
+                } else {
+                    self.to_meta_type(db)
+                        .find_name_in_mro_with_policy(db, name.as_str(), policy)
+                        .expect(
+                            "`Type::find_name_in_mro()` should return `Some()` when called on a meta-type",
+                        )
+                }
+            }
+
             // `type[Any]` (or `type[Unknown]`, etc.) has an unknown metaclass, but all
             // metaclasses inherit from `type`. Check `type`'s class-level attributes
             // first so that data descriptors like `__mro__` and `__bases__` resolve to
@@ -3496,8 +3522,7 @@ impl<'db> Type<'db> {
             }
 
             Type::NominalInstance(instance)
-                if matches!(name.as_str(), "major" | "minor")
-                    && instance.has_known_class(db, KnownClass::VersionInfo) =>
+                if matches!(name.as_str(), "major" | "minor") && instance.is_sys_version_info() =>
             {
                 let python_version = Program::get(db).python_version(db);
                 let segment = if name == "major" {
@@ -3816,16 +3841,6 @@ impl<'db> Type<'db> {
                 }
                 _ => None,
             }
-        }
-
-        let usize_len = match self.as_literal_value_kind() {
-            Some(LiteralValueTypeKind::Bytes(bytes)) => Some(bytes.python_len(db)),
-            Some(LiteralValueTypeKind::String(string)) => Some(string.python_len(db)),
-            _ => None,
-        };
-
-        if let Some(usize_len) = usize_len {
-            return usize_len.try_into().ok().map(Type::int_literal);
         }
 
         let return_ty = match self.try_call_dunder(
