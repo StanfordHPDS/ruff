@@ -28,11 +28,16 @@ pub(crate) use self::diagnostic::register_lints;
 pub use self::diagnostic::{TypeCheckDiagnostics, UNDEFINED_REVEAL, UNRESOLVED_REFERENCE};
 pub(crate) use self::infer::{
     InferredDeclaration, TypeContext, infer_complete_scope_types, infer_deferred_types,
-    infer_definition_types, infer_expression_type, infer_expression_types, infer_scope_types,
-    is_discarded_dict_key_assignment,
+    infer_definition_types, infer_expression_type, infer_expression_types,
+    infer_same_file_expression_type, infer_scope_types, is_discarded_dict_key_assignment,
 };
 pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
 pub use self::known_instance::KnownInstanceType;
+pub(crate) use self::match_pattern::{
+    definite_match_pattern_type, definite_sequence_pattern_type, exact_sequence_pattern_type,
+    mapping_pattern_type, sequence_pattern_type_builder, singleton_pattern_type,
+    starred_sequence_pattern_type,
+};
 pub(crate) use self::relation_error::{ErrorContext, ErrorContextTree, ParameterDescription};
 use self::set_theoretic::KnownUnion;
 pub(crate) use self::set_theoretic::builder::{
@@ -125,6 +130,7 @@ mod iteration;
 mod known_instance;
 pub mod list_members;
 mod literal;
+mod match_pattern;
 mod member;
 mod method;
 mod mro;
@@ -4774,7 +4780,7 @@ impl<'db> Type<'db> {
             })
         }
 
-        let (class_literal, class_specialization) = class.class_literal_and_specialization(db);
+        let class_literal = class.class_literal(db);
         let class_generic_context = class_literal.generic_context(db);
 
         // Keep bespoke constructor behavior for cases that don't map cleanly to `__new__`/`__init__`.
@@ -4795,7 +4801,7 @@ impl<'db> Type<'db> {
         // We don't want to use the synthesized binding for type inference, so here we just
         // return a permissive fallback binding.
         if class_literal.is_typed_dict(db)
-            || class::CodeGeneratorKind::TypedDict.matches(db, class_literal, class_specialization)
+            || class::CodeGeneratorKind::TypedDict.matches(db, class_literal)
         {
             return fallback_bindings();
         }
