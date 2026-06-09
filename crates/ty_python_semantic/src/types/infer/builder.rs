@@ -63,6 +63,7 @@ use crate::types::diagnostic::{
     report_match_pattern_against_non_runtime_checkable_protocol,
     report_match_pattern_against_typed_dict, report_mismatched_type_name,
     report_possibly_missing_attribute, report_possibly_unresolved_reference,
+    report_too_many_positional_patterns_for_callable_class_pattern,
     report_unsupported_augmented_assignment, report_unsupported_comparison,
 };
 use crate::types::enums::{enum_ignored_names, is_enum_class_by_inheritance};
@@ -71,6 +72,7 @@ use crate::types::function::{
 };
 use crate::types::generics::{
     GenericContext, InferableTypeVars, Specialization, SpecializationBuilder, bind_typevar,
+    enclosing_binding_contexts,
 };
 use crate::types::infer::builder::named_tuple::NamedTupleKind;
 use crate::types::infer::builder::paramspec_validation::validate_paramspec_components;
@@ -560,6 +562,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn scope(&self) -> ScopeId<'db> {
         self.scope
+    }
+
+    /// Returns call bindings annotated with the call site's enclosing binding contexts.
+    ///
+    /// Call binding uses this as an optimization hint to avoid freshening generic callable
+    /// signatures when the callable's generic context cannot collide with a containing scope.
+    fn bindings_for_call(&self, callable_type: Type<'db>) -> Bindings<'db> {
+        let db = self.db();
+        callable_type
+            .bindings(db)
+            .with_enclosing_binding_contexts(enclosing_binding_contexts(
+                self.index,
+                self.scope().file_scope_id(db),
+            ))
     }
 
     fn settings(&self) -> &AnalysisSettings {
@@ -2268,6 +2284,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn validate_class_pattern(&mut self, pattern: &ast::PatternMatchClass, cls_ty: Type<'db>) {
+        if let Type::SpecialForm(SpecialFormType::CollectionsAbcCallable) = cls_ty {
+            if let Some(first_excess_pattern) = pattern.arguments.patterns.first() {
+                report_too_many_positional_patterns_for_callable_class_pattern(
+                    &self.context,
+                    first_excess_pattern,
+                    pattern.arguments.patterns.len(),
+                );
+            }
+            return;
+        }
+
         if let Type::ClassLiteral(class) = cls_ty {
             if class.is_typed_dict(self.db()) {
                 report_match_pattern_against_typed_dict(&self.context, &*pattern.cls, class);
@@ -5410,8 +5437,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 definedness: boundness,
                 ..
             }) => {
-                let mut bindings = dunder_callable
-                    .bindings(db)
+                let mut bindings = self
+                    .bindings_for_call(dunder_callable)
                     .match_parameters(db, argument_types);
 
                 if let Err(call_error) = self.infer_and_check_argument_types(
@@ -8365,8 +8392,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
-        let mut bindings = callable_type
-            .bindings(self.db())
+        let mut bindings = self
+            .bindings_for_call(callable_type)
             .match_parameters(self.db(), &call_arguments);
 
         report_missing_implicit_constructor_call(
