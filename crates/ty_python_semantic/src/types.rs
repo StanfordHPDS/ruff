@@ -81,11 +81,12 @@ pub use crate::types::method::{BoundMethodType, KnownBoundMethodType, WrapperDes
 use crate::types::mro::{MroIterator, StaticMroError};
 pub(crate) use crate::types::narrow::{NarrowingConstraint, infer_narrowing_constraints};
 use crate::types::newtype::NewType;
+use crate::types::signatures::walk_signature;
 pub(crate) use crate::types::signatures::{Parameter, Parameters};
-use crate::types::signatures::{ParameterForm, walk_signature};
 use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::TupleSpec;
 pub use crate::types::type_alias::TypeAliasType;
+pub use crate::types::type_form::TypeFormType;
 pub(crate) use crate::types::typed_dict::TypedDictType;
 use crate::types::typevar::TypeVarInstance;
 pub use crate::types::typevar::{
@@ -150,6 +151,7 @@ mod subclass_of;
 pub(crate) mod tests;
 mod tuple;
 mod type_alias;
+mod type_form;
 mod typed_dict;
 mod typevar;
 mod unpacker;
@@ -245,6 +247,36 @@ fn definition_expression_type<'db>(
     } else {
         // expression is in a type-params sub-scope
         infer_complete_scope_types(db, scope).expression_type(expression)
+    }
+}
+
+/// Infer the type and qualifiers of a deferred annotation expression that is a sub-expression of
+/// a [`Definition`].
+///
+/// Supports expressions that are evaluated within a type-params sub-scope.
+fn definition_expression_annotation<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    expression: &ast::Expr,
+) -> TypeAndQualifiers<'db> {
+    let file = definition.file(db);
+    let index = semantic_index(db, file);
+    let file_scope = index.expression_scope_id(expression);
+    let scope = file_scope.to_scope_id(db, file);
+    if scope == definition.scope(db) {
+        let inference = infer_deferred_types(db, definition);
+        TypeAndQualifiers::new(
+            inference.expression_type(expression),
+            TypeOrigin::Declared,
+            inference.qualifiers(expression),
+        )
+    } else {
+        let inference = infer_complete_scope_types(db, scope);
+        TypeAndQualifiers::new(
+            inference.expression_type(expression),
+            TypeOrigin::Declared,
+            inference.qualifiers(expression),
+        )
     }
 }
 
@@ -946,6 +978,10 @@ struct GeneratorTypes<'db> {
     yield_ty: Option<Type<'db>>,
     send_ty: Option<Type<'db>>,
     return_ty: Option<Type<'db>>,
+}
+
+fn object_type_form(db: &dyn Db) -> Type<'_> {
+    TypeFormType::from_type_expression(db, Type::object())
 }
 
 #[salsa::tracked]
@@ -3557,7 +3593,9 @@ impl<'db> Type<'db> {
                             )
                             .or_fall_back_to(db, || {
                                 // If an attribute is not available on the bound method object,
-                                // it will be looked up on the underlying function object:
+                                // it will be looked up on the underlying function object. This
+                                // changes the lookup object, so do not forward the bound-method
+                                // receiver.
                                 Type::FunctionLiteral(bound_method.function(db))
                                     .member_lookup_with_policy(db, name, policy)
                             })
@@ -3748,7 +3786,7 @@ impl<'db> Type<'db> {
                     let nominal_lookup = partial
                         .partial(db)
                         .into_functools_partial_instance(db)
-                        .member_lookup_with_policy(db, name.clone(), policy);
+                        .member_lookup_with_policy_and_receiver(db, name.clone(), policy, receiver);
                     if name_str == "func" {
                         match nominal_lookup.place {
                             Place::Defined(DefinedPlace {
@@ -4116,8 +4154,7 @@ impl<'db> Type<'db> {
                                     Parameter::positional_only(Some(Name::new_static("value")))
                                         .with_annotated_type(Type::TypeVar(val_ty)),
                                     Parameter::positional_only(Some(Name::new_static("type")))
-                                        .type_form()
-                                        .with_annotated_type(Type::any()),
+                                        .with_annotated_type(object_type_form(db)),
                                 ],
                             ),
                             Type::TypeVar(val_ty),
@@ -4152,8 +4189,7 @@ impl<'db> Type<'db> {
                             db,
                             [
                                 Parameter::positional_or_keyword(Name::new_static("typ"))
-                                    .type_form()
-                                    .with_annotated_type(Type::any()),
+                                    .with_annotated_type(object_type_form(db)),
                                 Parameter::positional_or_keyword(Name::new_static("val"))
                                     .with_annotated_type(Type::any()),
                             ],
@@ -4558,8 +4594,7 @@ impl<'db> Type<'db> {
                                     Parameter::positional_or_keyword(Name::new_static("name"))
                                         .with_annotated_type(KnownClass::Str.to_instance(db)),
                                     Parameter::positional_or_keyword(Name::new_static("value"))
-                                        .with_annotated_type(Type::any())
-                                        .type_form(),
+                                        .with_annotated_type(object_type_form(db)),
                                     Parameter::keyword_only(Name::new_static("type_params"))
                                         .with_annotated_type(Type::homogeneous_tuple(
                                             db,
@@ -5856,6 +5891,21 @@ impl<'db> Type<'db> {
                 | Type::AlwaysFalsy
                 | Type::LiteralValue(_)
                 | Type::BoundSuper(_)
+                | Type::KnownInstance(
+                    KnownInstanceType::SubscriptedProtocol(_)
+                        | KnownInstanceType::SubscriptedGeneric(_)
+                        | KnownInstanceType::TypeAliasType(_)
+                        | KnownInstanceType::Deprecated(_)
+                        | KnownInstanceType::Field(_)
+                        | KnownInstanceType::ConstraintSet(_)
+                        | KnownInstanceType::GenericContext(_)
+                        | KnownInstanceType::Specialization(_)
+                        | KnownInstanceType::Literal(_)
+                        | KnownInstanceType::LiteralStringAlias(_)
+                        | KnownInstanceType::NewType(_)
+                        | KnownInstanceType::Sentinel(_)
+                        | KnownInstanceType::NamedTupleSpec(_),
+                )
                 | Type::KnownBoundMethod(
                     KnownBoundMethodType::StrStartswith(_)
                         | KnownBoundMethodType::ConstraintSetRange
@@ -8265,35 +8315,6 @@ impl<'db> VarianceInferable<'db> for TypeGuardType<'db> {
     // section of mdtest/generics/pep695/variance.md for details.
     fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
         self.return_type(db).variance_of(db, typevar)
-    }
-}
-
-#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
-pub struct TypeFormType<'db> {
-    type_argument: Type<'db>,
-}
-
-fn walk_typeform_type<'db, V: visitor::TypeVisitor<'db> + ?Sized>(
-    db: &'db dyn Db,
-    typeform_type: TypeFormType<'db>,
-    visitor: &V,
-) {
-    visitor.visit_type(db, typeform_type.type_argument(db));
-}
-
-// The Salsa heap is tracked separately.
-impl get_size2::GetSize for TypeFormType<'_> {}
-
-impl<'db> TypeFormType<'db> {
-    pub(crate) fn from_type_expression(db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
-        Type::TypeForm(Self::new(db, ty))
-    }
-}
-
-impl<'db> VarianceInferable<'db> for TypeFormType<'db> {
-    // `TypeForm` is covariant in its type argument.
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
-        self.type_argument(db).variance_of(db, typevar)
     }
 }
 
