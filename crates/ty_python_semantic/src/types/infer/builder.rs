@@ -22,10 +22,11 @@ use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
 use super::{
-    DefinitionInference, DefinitionInferenceExtra, DefinitionTypes, ExpressionInference,
-    ExpressionInferenceExtra, FrozenMap, FrozenSet, FunctionDecoratorInference, InferenceRegion,
-    ScopeInference, ScopeInferenceExtra, infer_deferred_types, infer_definition_types,
-    infer_expression_types, infer_same_file_expression_type, infer_unpack_types,
+    DeferredAndUndecorated, DefinitionInference, DefinitionInferenceExtra, DefinitionTypes,
+    ExpressionInference, ExpressionInferenceExtra, FrozenMap, FrozenSet,
+    FunctionDecoratorInference, InferenceRegion, OtherDefinitionInferenceExtra, ScopeInference,
+    ScopeInferenceExtra, infer_deferred_types, infer_definition_types, infer_expression_types,
+    infer_same_file_expression_type, infer_unpack_types,
 };
 use crate::diagnostic::format_enumeration;
 use crate::place::{
@@ -33,9 +34,10 @@ use crate::place::{
     RequiresExplicitReExport, TypeOrigin, builtins_module_scope, builtins_symbol,
     class_body_implicit_symbol, explicit_global_symbol, loop_header_reachability,
     module_type_implicit_global_declaration, module_type_implicit_global_symbol, place_by_id,
-    place_from_bindings, place_from_declarations, typing_extensions_symbol,
+    place_from_bindings_with_reachability_cache, place_from_declarations_with_reachability_cache,
+    typing_extensions_symbol,
 };
-use crate::reachability::ReachabilityConstraintsExtension;
+use crate::reachability::{ReachabilityEvaluationCache, evaluate_reachability_with_cache};
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
 use crate::types::call::bind::MatchingOverloadIndex;
 use crate::types::call::{Binding, Bindings, CallArguments, CallError, CallErrorKind};
@@ -69,6 +71,7 @@ use crate::types::diagnostic::{
 use crate::types::enums::{enum_ignored_names, is_enum_class_by_inheritance};
 use crate::types::function::{
     FunctionDecorators, FunctionType, KnownFunction, report_revealed_type,
+    same_module_uncached_raw_signature,
 };
 use crate::types::generics::{
     GenericContext, InferableTypeVars, Specialization, SpecializationBuilder, bind_typevar,
@@ -239,6 +242,12 @@ pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     /// An expression cache shared across builders during multi-inference.
     expression_cache: Option<Rc<RefCell<ExpressionCache<'db>>>>,
 
+    /// Reachability evaluations reused while inferring this region.
+    ///
+    /// Speculative builders share this cache with their parent so repeated place lookups performed
+    /// during multi-inference can reuse predicate truthiness computed by the parent builder.
+    reachability_cache: Rc<ReachabilityEvaluationCache<'db>>,
+
     /// Type qualifiers (`Required`, `NotRequired`, etc.) for annotation expressions.
     /// Only populated for expressions that have non-empty qualifiers.
     qualifiers: FxHashMap<ExpressionNodeKey, TypeQualifiers>,
@@ -358,6 +367,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         module: &'ast ParsedModuleRef,
     ) -> Self {
         let scope = region.scope(db);
+        let reachability_constraints = index
+            .use_def_map(scope.file_scope_id(db))
+            .reachability_constraints();
 
         Self {
             context: InferContext::new(db, scope, module),
@@ -369,6 +381,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             deferred_state: DeferredExpressionState::None,
             expressions: FxHashMap::default(),
             expression_cache: None,
+            reachability_cache: Rc::new(ReachabilityEvaluationCache::new(
+                scope,
+                reachability_constraints,
+            )),
             qualifiers: FxHashMap::default(),
             type_expression_flags: FxHashMap::default(),
             collection_use_constraints: FxHashMap::default(),
@@ -421,41 +437,74 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    fn extend_definition(&mut self, inference: &DefinitionInference<'db>) {
+    fn extend_definition(
+        &mut self,
+        definition: Definition<'db>,
+        inference: &DefinitionInference<'db>,
+    ) {
         #[cfg(debug_assertions)]
         assert_eq!(self.scope, inference.scope);
 
         self.expressions
             .extend(inference.expressions.iter().copied());
-        self.declarations.extend(inference.declarations());
+        self.declarations.extend(inference.declarations(definition));
 
         if !matches!(self.region, InferenceRegion::Scope(..)) {
-            self.bindings.extend(inference.bindings());
+            self.bindings.extend(inference.bindings(definition));
         }
 
         if let Some(extra) = &inference.extra {
-            self.called_functions
-                .extend(extra.called_functions.iter().copied());
-            self.extend_cycle_recovery(extra.cycle_recovery);
-            self.context.extend(&extra.diagnostics);
-            self.deferred.extend(extra.deferred.iter().copied());
-            self.string_annotations
-                .extend(extra.string_annotations.iter().copied());
-            self.expected_types
-                .extend(extra.expected_types.iter().copied());
-            self.qualifiers.extend(extra.qualifiers.iter().copied());
-            self.type_expression_flags
-                .extend(extra.type_expression_flags.iter().copied());
+            match extra.as_ref() {
+                DefinitionInferenceExtra::Qualifiers(qualifiers) => {
+                    self.qualifiers.extend(qualifiers.iter().copied());
+                }
+                DefinitionInferenceExtra::Deferred(deferred) => {
+                    self.deferred.extend(deferred.iter().copied());
+                }
+                DefinitionInferenceExtra::Diagnostics(diagnostics) => {
+                    self.context.extend(diagnostics);
+                }
+                DefinitionInferenceExtra::DeferredAndUndecorated(extra) => {
+                    self.deferred.extend(extra.deferred.iter().copied());
+                }
+                DefinitionInferenceExtra::CalledFunctions(called_functions) => {
+                    self.called_functions
+                        .extend(called_functions.iter().copied());
+                }
+                DefinitionInferenceExtra::ExpectedTypes(expected_types) => {
+                    self.expected_types.extend(expected_types.iter().copied());
+                }
+                DefinitionInferenceExtra::StringAnnotations(string_annotations) => {
+                    self.string_annotations
+                        .extend(string_annotations.iter().copied());
+                }
+                DefinitionInferenceExtra::Undecorated(_)
+                | DefinitionInferenceExtra::DiscardsDictKeyAssignments => {}
+                DefinitionInferenceExtra::Other(extra) => {
+                    self.called_functions
+                        .extend(extra.called_functions.iter().copied());
+                    self.extend_cycle_recovery(extra.cycle_recovery);
+                    self.context.extend(&extra.diagnostics);
+                    self.deferred.extend(extra.deferred.iter().copied());
+                    self.string_annotations
+                        .extend(extra.string_annotations.iter().copied());
+                    self.expected_types
+                        .extend(extra.expected_types.iter().copied());
+                    self.qualifiers.extend(extra.qualifiers.iter().copied());
+                    self.type_expression_flags
+                        .extend(extra.type_expression_flags.iter().copied());
 
-            #[expect(
-                clippy::iter_over_hash_type,
-                reason = "constraints for distinct collection definitions are merged independently"
-            )]
-            for (collection_def, constraints) in &extra.collection_use_constraints {
-                self.collection_use_constraints
-                    .entry(*collection_def)
-                    .and_modify(|this| this.extend(constraints))
-                    .or_insert(constraints.clone());
+                    #[expect(
+                        clippy::iter_over_hash_type,
+                        reason = "constraints for distinct collection definitions are merged independently"
+                    )]
+                    for (collection_def, constraints) in &extra.collection_use_constraints {
+                        self.collection_use_constraints
+                            .entry(*collection_def)
+                            .and_modify(|this| this.extend(constraints))
+                            .or_insert(constraints.clone());
+                    }
+                }
             }
         }
     }
@@ -464,7 +513,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let inference = match inference {
             StatementInference::Other(inference) => inference,
             StatementInference::Expression(inference) => return self.extend_expression(inference),
-            StatementInference::Definition(inference) => return self.extend_definition(inference),
+            StatementInference::Definition(definition, inference) => {
+                return self.extend_definition(*definition, inference);
+            }
         };
 
         #[cfg(debug_assertions)]
@@ -855,7 +906,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Infer deferred types for all definitions.
         let deferred_definitions: Vec<_> = std::mem::take(&mut self.deferred).into_iter().collect();
         for definition in &deferred_definitions {
-            self.extend_definition(infer_deferred_types(self.db(), *definition));
+            self.extend_definition(*definition, infer_deferred_types(self.db(), *definition));
         }
 
         assert!(
@@ -1186,84 +1237,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let place_table = self.index.place_table(file_scope_id);
         let use_def = self.index.use_def_map(file_scope_id);
 
-        let global_use_def_map = self.index.use_def_map(FileScopeId::global());
         let place_id = binding.place(self.db());
         let place = place_table.place(place_id);
 
-        let (declarations, is_local) = if let Some(symbol) = place.as_symbol() {
-            let symbol_id = place_id.expect_symbol();
-            let skip_non_global_scopes = self.skip_non_global_scopes(file_scope_id, symbol_id);
-
-            if skip_non_global_scopes {
-                match self
-                    .index
-                    .place_table(FileScopeId::global())
-                    .symbol_id(symbol.name())
-                {
-                    Some(id) => (
-                        global_use_def_map.end_of_scope_symbol_declarations(id),
-                        false,
-                    ),
-                    // This variable shows up in `global` declarations but doesn't have an explicit
-                    // binding in the global scope.
-                    None => (use_def.declarations_at_binding(binding), true),
-                }
-            } else if self
-                .index
-                .symbol_is_nonlocal_in_scope(symbol_id, file_scope_id)
-            {
-                // If we run out of ancestor scopes without finding a definition, we'll fall back to
-                // the local scope. This will also be a syntax error in `infer_nonlocal_statement` (no
-                // binding for `nonlocal` found), but ignore that here.
-                let mut declarations = use_def.declarations_at_binding(binding);
-                let mut is_local = true;
-                // Walk up parent scopes looking for the enclosing scope that has definition of this
-                // name. `ancestor_scopes` includes the current scope, so skip that one.
-                for (enclosing_scope_file_id, enclosing_scope) in
-                    self.index.ancestor_scopes(file_scope_id).skip(1)
-                {
-                    // Ignore class scopes and the global scope.
-                    if !enclosing_scope.kind().is_function_like() {
-                        continue;
-                    }
-                    let enclosing_place_table = self.index.place_table(enclosing_scope_file_id);
-                    let Some(enclosing_symbol_id) = enclosing_place_table.symbol_id(symbol.name())
-                    else {
-                        // This ancestor scope doesn't have a binding. Keep going.
-                        continue;
-                    };
-
-                    let enclosing_symbol = enclosing_place_table.symbol(enclosing_symbol_id);
-                    if enclosing_symbol.is_global() {
-                        // The variable is `global` in this ancestor scope. This breaks the `nonlocal`
-                        // chain, and it's a syntax error in `infer_nonlocal_statement`. Ignore that
-                        // here and just bail out of this loop.
-                        break;
-                    }
-                    if !enclosing_symbol.is_local() {
-                        // The variable is either explicitly `nonlocal` or just a free read in this
-                        // ancestor scope. Keep going.
-                        continue;
-                    }
-                    // We found the closest definition. Note that (as in `infer_place_load`) this does
-                    // *not* need to be a binding. It could be just a declaration, e.g. `x: int`.
-                    declarations = self
-                        .index
-                        .use_def_map(enclosing_scope_file_id)
-                        .end_of_scope_symbol_declarations(enclosing_symbol_id);
-                    is_local = false;
-                    break;
-                }
-                (declarations, is_local)
-            } else {
-                (use_def.declarations_at_binding(binding), true)
-            }
+        let (declarations, is_local) = if let Some(symbol) = place_id.as_symbol()
+            && let Some((owner_scope, owner_symbol)) =
+                self.forwarded_assignment_owner(file_scope_id, symbol)
+        {
+            (
+                self.index
+                    .use_def_map(owner_scope)
+                    .end_of_scope_symbol_declarations(owner_symbol),
+                false,
+            )
         } else {
             (use_def.declarations_at_binding(binding), true)
         };
 
-        let (mut place_and_quals, conflicting) = place_from_declarations(self.db(), declarations)
-            .into_place_and_conflicting_declarations();
+        let (mut place_and_quals, conflicting) = place_from_declarations_with_reachability_cache(
+            self.db(),
+            declarations,
+            &self.reachability_cache,
+        )
+        .into_place_and_conflicting_declarations();
 
         if let Some(conflicting) = conflicting {
             // TODO point out the conflicting declarations in the diagnostic?
@@ -1344,6 +1340,83 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
+    /// Returns the owner of an assignment redirected by `global` or `nonlocal`.
+    ///
+    /// `global` assignments target the module symbol, while `nonlocal` assignments target the
+    /// closest owning function-like scope. Local assignments and forwarding declarations whose
+    /// owner cannot be resolved return `None`.
+    ///
+    /// ```python
+    /// x = 0
+    ///
+    /// def outer():
+    ///     y = 0
+    ///
+    ///     def inner():
+    ///         global x
+    ///         nonlocal y
+    ///         x = 1  # owned by the module scope
+    ///         y = 1  # owned by `outer`
+    /// ```
+    fn forwarded_assignment_owner(
+        &self,
+        scope: FileScopeId,
+        symbol: ScopedSymbolId,
+    ) -> Option<(FileScopeId, ScopedSymbolId)> {
+        let scoped_symbol = self.index.place_table(scope).symbol(symbol);
+
+        if scope.is_global() || scoped_symbol.is_local() {
+            return None;
+        }
+
+        if scoped_symbol.is_global() {
+            let global_scope = FileScopeId::global();
+            // If this variable appears in a `global` declaration but has no explicit binding in
+            // the global scope, return `None` so the caller can fall back to the local scope.
+            return self
+                .index
+                .place_table(global_scope)
+                .symbol_id(scoped_symbol.name())
+                .map(|symbol| (global_scope, symbol));
+        }
+
+        debug_assert!(scoped_symbol.is_nonlocal());
+
+        // Walk up parent scopes looking for the enclosing scope that defines this name.
+        // `ancestor_scopes` includes the current scope, so skip that one.
+        for (enclosing_scope, enclosing) in self.index.ancestor_scopes(scope).skip(1) {
+            // Ignore class scopes and the global scope.
+            if !enclosing.kind().is_function_like() {
+                continue;
+            }
+            let place_table = self.index.place_table(enclosing_scope);
+            let Some(enclosing_symbol) = place_table.symbol_id(scoped_symbol.name()) else {
+                // This ancestor scope doesn't have a binding. Keep going.
+                continue;
+            };
+            let symbol = place_table.symbol(enclosing_symbol);
+            if symbol.is_global() {
+                // The variable is `global` in this ancestor scope. This breaks the `nonlocal`
+                // chain, and it's a syntax error in `infer_nonlocal_statement`. Ignore that here
+                // and bail out of this loop.
+                break;
+            }
+            if !symbol.is_local() {
+                // The variable is either explicitly `nonlocal` or just a free read in this
+                // ancestor scope. Keep going.
+                continue;
+            }
+
+            // We found the closest definition. Note that (as in `infer_place_load`) this does not
+            // need to be a binding. It could be just a declaration, e.g. `x: int`.
+            return Some((enclosing_scope, enclosing_symbol));
+        }
+
+        // If no ancestor owns the name, return `None` so the caller can fall back to the local
+        // scope. This will also be reported as a syntax error in `infer_nonlocal_statement`.
+        None
+    }
+
     /// Returns `true` if `symbol_id` should be looked up in the global scope, skipping intervening
     /// local scopes.
     fn skip_non_global_scopes(
@@ -1372,28 +1445,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let use_def = self.index.use_def_map(declaration.file_scope(self.db()));
         let prior_bindings = use_def.bindings_at_definition(declaration);
         // unbound_ty is Never because for this check we don't care about unbound
-        let inferred_ty = place_from_bindings(self.db(), prior_bindings)
-            .place
-            .with_qualifiers(TypeQualifiers::empty())
-            .or_fall_back_to(self.db(), || {
-                // Fallback to bindings declared on `types.ModuleType` if it's a global symbol
-                let scope = self.scope().file_scope_id(self.db());
-                let place = self
-                    .index
-                    .place_table(scope)
-                    .place(declaration.place(self.db()));
+        let inferred_ty = place_from_bindings_with_reachability_cache(
+            self.db(),
+            prior_bindings,
+            &self.reachability_cache,
+        )
+        .place
+        .with_qualifiers(TypeQualifiers::empty())
+        .or_fall_back_to(self.db(), || {
+            // Fallback to bindings declared on `types.ModuleType` if it's a global symbol
+            let scope = self.scope().file_scope_id(self.db());
+            let place = self
+                .index
+                .place_table(scope)
+                .place(declaration.place(self.db()));
 
-                if let PlaceExprRef::Symbol(symbol) = &place
-                    && scope.is_global()
-                {
-                    module_type_implicit_global_symbol(self.db(), symbol.name())
-                } else {
-                    Place::Undefined.into()
-                }
-            })
-            .place
-            .ignore_possibly_undefined()
-            .unwrap_or(Type::Never);
+            if let PlaceExprRef::Symbol(symbol) = &place
+                && scope.is_global()
+            {
+                module_type_implicit_global_symbol(self.db(), symbol.name())
+            } else {
+                Place::Undefined.into()
+            }
+        })
+        .place
+        .ignore_possibly_undefined()
+        .unwrap_or(Type::Never);
         let ty = if inferred_ty.is_assignable_to(self.db(), ty.inner_type()) {
             ty
         } else {
@@ -1730,7 +1807,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_definition(&mut self, node: impl Into<DefinitionNodeKey> + std::fmt::Debug + Copy) {
         let definition = self.index.expect_single_definition(node);
         let result = infer_definition_types(self.db(), definition);
-        self.extend_definition(result);
+        self.extend_definition(definition, result);
     }
 
     fn infer_type_alias_definition(
@@ -2238,11 +2315,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .symbol_id(&nested_bindings_kind.name)
                 .unwrap();
             let use_def = self.index.use_def_map(declaration.file_scope_id);
-            let Some(ty) =
-                place_from_bindings(db, use_def.reachable_bindings(nested_symbol_id.into()))
-                    .place
-                    .raw_type()
-            else {
+            let Some(ty) = place_from_bindings_with_reachability_cache(
+                db,
+                use_def.reachable_bindings(nested_symbol_id.into()),
+                &self.reachability_cache,
+            )
+            .place
+            .raw_type() else {
                 continue;
             };
             union.add_in_place(ty);
@@ -3360,7 +3439,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                         return true;
                     }
-                    Err(CallDunderError::CallError(kind, _bindings)) => {
+                    Err(CallDunderError::CallError(kind, _bindings, _)) => {
                         if emit_diagnostics {
                             report_bad_dunder_delattr_call(
                                 &self.context,
@@ -3420,7 +3499,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     match delete_dunder_call_result {
                         Ok(_) | Err(CallDunderError::PossiblyUnbound { .. }) => return true,
-                        Err(CallDunderError::CallError(kind, bindings)) => {
+                        Err(CallDunderError::CallError(kind, bindings, _)) => {
                             if emit_diagnostics {
                                 let failure = CallError(kind, bindings);
                                 report_bad_dunder_delete_call(
@@ -4893,7 +4972,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             binary_return_ty(self, value_ty),
                         )
                     }
-                    Err(CallDunderError::CallError(_, bindings)) => {
+                    Err(CallDunderError::CallError(_, bindings, _)) => {
                         let value_ty = bindings.type_for_argument(&call_arguments, 0);
                         report_unsupported_augmented_assignment(
                             &self.context,
@@ -5109,13 +5188,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // the expected type passed should be the "raw" type,
                     // i.e. type variables in the return type are non-inferable,
                     // and the return types of async functions are not wrapped in `CoroutineType[...]`.
-                    let return_ty = func
-                        .literal(self.db())
-                        .last_definition_raw_signature(
-                            self.db(),
-                            ReturnCallableTypeVarScope::Lexical,
-                        )
-                        .return_ty;
+                    let return_ty = same_module_uncached_raw_signature(
+                        self.db(),
+                        func,
+                        ReturnCallableTypeVarScope::Lexical,
+                    )
+                    .return_ty;
 
                     // For generator functions, the declared return type is e.g.
                     // `Generator[YieldType, SendType, ReturnType]`. The type context
@@ -5418,6 +5496,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Place::Defined(DefinedPlace {
                 ty: dunder_callable,
                 definedness: boundness,
+                provenance,
                 ..
             }) => {
                 let mut bindings = self
@@ -5431,7 +5510,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     &mut bindings,
                     call_expression_tcx,
                 ) {
-                    return Err(CallDunderError::CallError(call_error, Box::new(bindings)));
+                    return Err(CallDunderError::CallError(
+                        call_error,
+                        Box::new(bindings),
+                        provenance,
+                    ));
                 }
 
                 if boundness == Definedness::PossiblyUndefined {
@@ -7675,7 +7758,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if named.target.is_name_expr() {
             let definition = self.index.expect_single_definition(named);
             let result = infer_definition_types(self.db(), definition);
-            self.extend_definition(result);
+            self.extend_definition(definition, result);
             result.binding_type(definition)
         } else {
             // For syntactically invalid targets, we still need to run type inference:
@@ -7940,7 +8023,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut elements: Vec<(&str, Type<'db>)> = Vec::new();
 
         for bindings in use_def.multi_bindings_at_use(keyword.scoped_use_id(db, self.file())) {
-            let place = place_from_bindings(db, bindings.clone());
+            let place = place_from_bindings_with_reachability_cache(
+                db,
+                bindings.clone(),
+                &self.reachability_cache,
+            );
             let Some(key) = place.first_definition.and_then(definition_key) else {
                 continue;
             };
@@ -8743,10 +8830,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let _ = self.infer_optional_expression(value.as_deref(), TypeContext::default());
             return Type::unknown();
         };
-        let declared_return_ty = enclosing_function
-            .literal(self.db())
-            .last_definition_raw_signature(self.db(), ReturnCallableTypeVarScope::Public)
-            .return_ty;
+        let declared_return_ty = same_module_uncached_raw_signature(
+            self.db(),
+            enclosing_function,
+            ReturnCallableTypeVarScope::Public,
+        )
+        .return_ty;
         let return_type_span = enclosing_function.spans(self.db()).return_type;
 
         let Some(generator_type_params) = declared_return_ty.generator_types(self.db()) else {
@@ -8792,10 +8881,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let _ = self.infer_expression(value, TypeContext::default());
             return Type::unknown();
         };
-        let annotated_return_ty = enclosing_function
-            .literal(self.db())
-            .last_definition_raw_signature(self.db(), ReturnCallableTypeVarScope::Public)
-            .return_ty;
+        let annotated_return_ty = same_module_uncached_raw_signature(
+            self.db(),
+            enclosing_function,
+            ReturnCallableTypeVarScope::Public,
+        )
+        .return_ty;
 
         let Some(outer_expected) = annotated_return_ty.generator_types(self.db()) else {
             let _ = self.infer_expression(value, TypeContext::default());
@@ -8914,8 +9005,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     let predicates = bindings.predicates();
                     let mut union = UnionBuilder::new(db);
                     for binding in bindings {
-                        let static_reachability = reachability_constraints.evaluate(
+                        let static_reachability = evaluate_reachability_with_cache(
                             db,
+                            Some(&self.reachability_cache),
+                            reachability_constraints,
                             predicates,
                             binding.reachability_constraint,
                         );
@@ -9083,7 +9176,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // If we're inferring types of deferred expressions, look them up from end-of-scope.
         if self.is_deferred() {
             let place = if let Some(place_id) = place_table.place_id(expr) {
-                place_from_bindings(db, use_def.reachable_bindings(place_id)).place
+                place_from_bindings_with_reachability_cache(
+                    db,
+                    use_def.reachable_bindings(place_id),
+                    &self.reachability_cache,
+                )
+                .place
             } else {
                 assert!(
                     self.in_string_annotation(),
@@ -9106,7 +9204,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             if let ast::ExprRef::Named(named) = expr_ref {
                 let place = if named.target.is_name_expr() {
                     let definition = self.index.expect_single_definition(named);
-                    Place::bound(binding_type(db, definition))
+                    Place::bound(binding_type(db, definition)).with_definition(definition)
                 } else {
                     Place::Undefined
                 };
@@ -9114,7 +9212,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             let use_id = expr_ref.scoped_use_id(db, self.file());
-            let place = place_from_bindings(db, use_def.bindings_at_use(use_id)).place;
+            let place = place_from_bindings_with_reachability_cache(
+                db,
+                use_def.bindings_at_use(use_id),
+                &self.reachability_cache,
+            )
+            .place;
 
             (place, Some(use_id))
         }
@@ -9163,7 +9266,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     return Place::Undefined.into();
                 }
                 EnclosingSnapshotResult::FoundBindings(bindings) => {
-                    let mut place_and_qualifiers = place_from_bindings(db, bindings);
+                    let mut place_and_qualifiers = place_from_bindings_with_reachability_cache(
+                        db,
+                        bindings,
+                        &self.reachability_cache,
+                    );
                     if assume_bound && let Place::Defined(defined) = place_and_qualifiers.place {
                         place_and_qualifiers.place =
                             Place::Defined(defined.with_definedness(Definedness::AlwaysDefined));
@@ -9368,7 +9475,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             }
                         }
                         EnclosingSnapshotResult::FoundBindings(bindings) => {
-                            let place = place_from_bindings(db, bindings).place.map_type(|ty| {
+                            let place = place_from_bindings_with_reachability_cache(
+                                db,
+                                bindings,
+                                &self.reachability_cache,
+                            )
+                            .place
+                            .map_type(|ty| {
                                 self.narrow_place_with_applicable_constraints(
                                     place_expr,
                                     ty,
@@ -10432,6 +10545,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // builder only state
             expression_cache: _,
+            reachability_cache: _,
             typevar_binding_context: _,
             deferred_state: _,
             called_functions: _,
@@ -10513,6 +10627,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // builder only state
             expression_cache: _,
+            reachability_cache: _,
             dataclass_field_specifiers: _,
             typevar_binding_context: _,
             deferred_state: _,
@@ -10607,6 +10722,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             bindings,
             called_functions,
             expression_cache: _,
+            reachability_cache: _,
             declarations: _,
             deferred: _,
             scope: _,
@@ -10639,7 +10755,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    pub(super) fn finish_definition(mut self) -> DefinitionInference<'db> {
+    pub(super) fn finish_definition(
+        mut self,
+        definition: Definition<'db>,
+    ) -> DefinitionInference<'db> {
         self.infer_region();
 
         let Self {
@@ -10661,6 +10780,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // builder only state
             expression_cache: _,
+            reachability_cache: _,
             dataclass_field_specifiers: _,
             typevar_binding_context: _,
             deferred_state: _,
@@ -10672,20 +10792,59 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let _ = scope;
         let diagnostics = context.finish();
 
-        let extra = (!diagnostics.is_empty()
-            || !string_annotations.is_empty()
-            || !expected_types.is_empty()
-            || cycle_recovery.is_some()
-            || undecorated_type.is_some()
-            || !deferred.is_empty()
-            || !called_functions.is_empty()
-            || !qualifiers.is_empty()
-            || !type_expression_flags.is_empty()
-            || !collection_use_constraints.is_empty()
-            || discards_dict_key_assignments)
-            .then(|| {
+        let non_undecorated_extra_field_count = usize::from(!string_annotations.is_empty())
+            + usize::from(!expected_types.is_empty())
+            + usize::from(!collection_use_constraints.is_empty())
+            + usize::from(!called_functions.is_empty())
+            + usize::from(!type_expression_flags.is_empty())
+            + usize::from(cycle_recovery.is_some())
+            + usize::from(!deferred.is_empty())
+            + usize::from(!diagnostics.is_empty())
+            + usize::from(discards_dict_key_assignments)
+            + usize::from(!qualifiers.is_empty());
+
+        let extra = match (non_undecorated_extra_field_count, undecorated_type) {
+            (0, None) => None,
+            (1, None) if !qualifiers.is_empty() => Some(Box::new(
+                DefinitionInferenceExtra::Qualifiers(FrozenMap::from(qualifiers)),
+            )),
+            (1, None) if !deferred.is_empty() => Some(Box::new(
+                DefinitionInferenceExtra::Deferred(deferred.into_boxed_slice()),
+            )),
+            (1, None) if !diagnostics.is_empty() => Some(Box::new(
+                DefinitionInferenceExtra::Diagnostics(Box::new(diagnostics)),
+            )),
+            (1, None) if !called_functions.is_empty() => {
+                Some(Box::new(DefinitionInferenceExtra::CalledFunctions(
+                    called_functions
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )))
+            }
+            (1, None) if !expected_types.is_empty() => Some(Box::new(
+                DefinitionInferenceExtra::ExpectedTypes(FrozenMap::from(expected_types)),
+            )),
+            (1, None) if !string_annotations.is_empty() => Some(Box::new(
+                DefinitionInferenceExtra::StringAnnotations(FrozenSet::from(string_annotations)),
+            )),
+            (1, None) if discards_dict_key_assignments => Some(Box::new(
+                DefinitionInferenceExtra::DiscardsDictKeyAssignments,
+            )),
+            (0, Some(undecorated_type)) => Some(Box::new(DefinitionInferenceExtra::Undecorated(
+                Box::new(undecorated_type),
+            ))),
+            (1, Some(undecorated_type)) if !deferred.is_empty() => {
+                Some(Box::new(DefinitionInferenceExtra::DeferredAndUndecorated(
+                    Box::new(DeferredAndUndecorated {
+                        deferred: deferred.into_boxed_slice(),
+                        undecorated_type,
+                    }),
+                )))
+            }
+            (_, undecorated_type) => {
                 collection_use_constraints.shrink_to_fit();
-                Box::new(DefinitionInferenceExtra {
+                let extra = OtherDefinitionInferenceExtra {
                     string_annotations: FrozenSet::from(string_annotations),
                     expected_types: FrozenMap::from(expected_types),
                     collection_use_constraints,
@@ -10700,8 +10859,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     undecorated_type,
                     discards_dict_key_assignments,
                     qualifiers: FrozenMap::from(qualifiers),
-                })
-            });
+                };
+                Some(Box::new(DefinitionInferenceExtra::Other(Box::new(extra))))
+            }
+        };
 
         if bindings.len() > 20 {
             tracing::debug!(
@@ -10723,7 +10884,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             expressions: FrozenMap::from(expressions),
             #[cfg(debug_assertions)]
             scope,
-            types: DefinitionTypes::from_parts(bindings.into_vec(), declarations.into_vec()),
+            types: DefinitionTypes::from_parts(
+                definition,
+                bindings.into_vec(),
+                declarations.into_vec(),
+            ),
             extra,
         }
     }
@@ -10753,6 +10918,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // Builder only state
             expression_cache: _,
+            reachability_cache: _,
             dataclass_field_specifiers: _,
             typevar_binding_context: _,
             deferred_state: _,
@@ -10808,6 +10974,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             deferred_state,
             typevar_binding_context,
             ref expression_cache,
+            ref reachability_cache,
             ref return_types_and_ranges,
             ref dataclass_field_specifiers,
 
@@ -10840,6 +11007,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         builder.typevar_binding_context = typevar_binding_context;
         builder.context.inference_flags = self.inference_flags();
         builder.expression_cache.clone_from(expression_cache);
+        builder.reachability_cache.clone_from(reachability_cache);
         builder
             .return_types_and_ranges
             .clone_from(return_types_and_ranges);
@@ -10872,6 +11040,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // builder only state
             expression_cache: _,
+            reachability_cache: _,
             typevar_binding_context: _,
             deferred_state: _,
             called_functions,

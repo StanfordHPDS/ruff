@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "ruff"
-version = "0.15.16"
+version = "0.15.17"
 dependencies = [
  "anyhow",
  "argfile",
@@ -3086,6 +3086,7 @@ dependencies = [
  "ruff_text_size",
  "rustc-hash",
  "salsa",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",
@@ -3204,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "ruff_linter"
-version = "0.15.16"
+version = "0.15.17"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3597,7 +3598,7 @@ dependencies = [
 
 [[package]]
 name = "ruff_wasm"
-version = "0.15.16"
+version = "0.15.17"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
@@ -4806,6 +4807,7 @@ dependencies = [
  "ruff_text_size",
  "strum",
  "strum_macros",
+ "tempfile",
  "tracing",
  "ty_static",
 ]
