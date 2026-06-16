@@ -1032,6 +1032,28 @@ reveal_type(x14)  # revealed: list[Divergent]
 reveal_type(x15)  # revealed: list[Divergent]
 ```
 
+Collection-use constraints must converge when multiple collection literals are used in a container
+literal. This is a regression test for <https://github.com/astral-sh/ty/issues/3778>.
+
+```py
+from typing import Any
+
+def run(cond: bool, d: dict[Any, Any]) -> list[Any]:
+    a = {}
+    b = {}
+    if cond:
+        b = d
+    return [a.get("x", 0), b.get("x", 0)]
+
+def assigned(cond: bool, d: dict[Any, Any]) -> list[Any]:
+    a = {}
+    b = {}
+    if cond:
+        b = d
+    result: list[Any] = [a.get("x", 0), b.get("x", 0)]
+    return result
+```
+
 ```py
 def _(i):
     x16 = []
@@ -1090,6 +1112,20 @@ def _(flag: bool):
 
     # TODO: This should reveal `list[int]`.
     reveal_type(x22)  # revealed: list[Unknown]
+```
+
+```py
+x23 = [None, None, None]
+x23[0] = 1
+x23[1] = "2"
+x23[2] = 3.0
+reveal_type(x23)  # revealed: list[int | str | float | None]
+```
+
+```py
+x24 = {"a": 1}
+x24[1] = "b"
+reveal_type(x24)  # revealed: dict[int | str, str | int]
 ```
 
 ## Multi-inference diagnostics
