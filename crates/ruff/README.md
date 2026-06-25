@@ -37,14 +37,19 @@ The following Ruff workspace members are also available:
 - [ruff_python_semantic](https://crates.io/crates/ruff_python_semantic)
 - [ruff_python_stdlib](https://crates.io/crates/ruff_python_stdlib)
 - [ruff_python_trivia](https://crates.io/crates/ruff_python_trivia)
+- [ruff_ranged_value](https://crates.io/crates/ruff_ranged_value)
 - [ruff_server](https://crates.io/crates/ruff_server)
 - [ruff_source_file](https://crates.io/crates/ruff_source_file)
 - [ruff_text_size](https://crates.io/crates/ruff_text_size)
 - [ruff_wasm](https://crates.io/crates/ruff_wasm)
 - [ruff_workspace](https://crates.io/crates/ruff_workspace)
+- [ty_combine](https://crates.io/crates/ty_combine)
 - [ty_module_resolver](https://crates.io/crates/ty_module_resolver)
+- [ty_python_core](https://crates.io/crates/ty_python_core)
+- [ty_python_semantic](https://crates.io/crates/ty_python_semantic)
 - [ty_site_packages](https://crates.io/crates/ty_site_packages)
 - [ty_static](https://crates.io/crates/ty_static)
+- [ty_vendored](https://crates.io/crates/ty_vendored)
 
 Ruff's workspace members are considered internal and will have frequent breaking changes.
 
