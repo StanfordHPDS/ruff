@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use except_handlers::TryNodeContextStackManager;
 use itertools::Itertools;
-use ruff_python_ast::helpers::{any_over_expr, is_dotted_name};
+use ruff_python_ast::helpers::{Truthiness, any_over_expr, is_dotted_name};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use ruff_db::files::File;
@@ -43,7 +43,8 @@ use crate::place::{
     match_subject_place_expressions,
 };
 use crate::predicate::{
-    CallableAndCallExpr, ClassPatternKind, PatternPredicate, PatternPredicateKind, Predicate,
+    CallableAndCallExpr, ClassPatternKeywordPredicateKind, ClassPatternPredicateKind,
+    MappingPatternEntryPredicateKind, PatternPredicate, PatternPredicateKind, Predicate,
     PredicateNode, PredicateOrLiteral, ScopedPredicateId, SequencePatternPredicateKind,
     StarImportPlaceholderPredicate, SubjectElementPatternPredicate,
 };
@@ -2041,38 +2042,38 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             ast::Pattern::MatchClass(pattern) => {
                 let cls = self.add_standalone_expression(&pattern.cls);
 
-                // TODO: A class pattern with only irrefutable subpatterns can still fail if
-                // extracting an attribute named by `__match_args__` or a keyword fails. We retain
-                // this existing approximation because treating all class patterns with arguments
-                // as refutable caused a large ecosystem change. Follow-up work should determine
-                // irrefutability by analyzing the class's attributes and `__match_args__`.
-                PatternPredicateKind::Class(
-                    cls,
-                    if pattern
+                PatternPredicateKind::Class(ClassPatternPredicateKind {
+                    class: cls,
+                    positional: pattern
                         .arguments
                         .patterns
                         .iter()
-                        .all(ast::Pattern::is_irrefutable)
-                        && pattern
-                            .arguments
-                            .keywords
-                            .iter()
-                            .all(|kw| kw.pattern.is_irrefutable())
-                    {
-                        ClassPatternKind::Irrefutable
-                    } else {
-                        ClassPatternKind::Refutable
-                    },
-                )
+                        .map(|pattern| self.predicate_kind(pattern))
+                        .collect(),
+                    keywords: pattern
+                        .arguments
+                        .keywords
+                        .iter()
+                        .map(|keyword| ClassPatternKeywordPredicateKind {
+                            attr: keyword.attr.id.clone(),
+                            pattern: self.predicate_kind(&keyword.pattern),
+                        })
+                        .collect(),
+                })
             }
             ast::Pattern::MatchMapping(pattern) => {
-                // `case {}` and `case {**rest}` match every mapping, while keyed mapping
-                // patterns are refutable (`case {"x": _}` may fail for some mappings).
-                PatternPredicateKind::Mapping(if pattern.keys.is_empty() {
-                    ClassPatternKind::Irrefutable
-                } else {
-                    ClassPatternKind::Refutable
-                })
+                // Retain keyed entries for subject-aware exhaustiveness analysis.
+                PatternPredicateKind::Mapping(
+                    pattern
+                        .keys
+                        .iter()
+                        .zip(&pattern.patterns)
+                        .map(|(key, pattern)| MappingPatternEntryPredicateKind {
+                            key: self.add_standalone_expression(key),
+                            pattern: self.predicate_kind(pattern),
+                        })
+                        .collect(),
+                )
             }
             ast::Pattern::MatchSequence(pattern) => {
                 PatternPredicateKind::Sequence(SequencePatternPredicateKind {
@@ -2909,22 +2910,33 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         self.seen_submodule_imports
                             .insert(direct_submodule.to_owned());
 
-                        let direct_submodule_name = Name::new(direct_submodule);
-                        let symbol = self.add_symbol(direct_submodule_name);
+                        let is_immediately_shadowed = node.names.iter().any(|alias| {
+                            if &alias.name == "*" {
+                                return false;
+                            }
 
-                        let module_index = if node.level == 0 {
-                            // "whatever.thispackage.x.y" we want `x`
-                            thispackage.components().count()
-                        } else {
-                            // ".x.y" we want `x` (level 1 => index 0)
-                            // "..x.y" we want `y` (level 2 => index 1)
-                            // (The Identifier doesn't include the prefix dots)
-                            node.level as usize - 1
-                        };
-                        self.add_definition(
-                            symbol.into(),
-                            ImportFromSubmoduleDefinitionNodeRef { node, module_index },
-                        );
+                            let bound_name = alias.asname.as_ref().unwrap_or(&alias.name);
+                            bound_name.id.as_str() == direct_submodule
+                        });
+
+                        if !is_immediately_shadowed {
+                            let direct_submodule_name = Name::new(direct_submodule);
+                            let symbol = self.add_symbol(direct_submodule_name);
+
+                            let module_index = if node.level == 0 {
+                                // "whatever.thispackage.x.y" we want `x`
+                                thispackage.components().count()
+                            } else {
+                                // ".x.y" we want `x` (level 1 => index 0)
+                                // "..x.y" we want `y` (level 2 => index 1)
+                                // (The Identifier doesn't include the prefix dots)
+                                node.level as usize - 1
+                            };
+                            self.add_definition(
+                                symbol.into(),
+                                ImportFromSubmoduleDefinitionNodeRef { node, module_index },
+                            );
+                        }
                     }
                 }
 
@@ -3470,7 +3482,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 for_stmt @ ast::StmtFor {
                     range: _,
                     node_index: _,
-                    is_async: _,
+                    is_async,
                     target,
                     iter,
                     body,
@@ -3482,20 +3494,34 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 let iter_expr = self.add_standalone_expression(iter);
                 self.visit_expr(iter);
 
-                let non_empty_range_constraint = if is_direct_range_call(iter) {
-                    let after_iter = self.flow_snapshot();
-                    let constraint = self.record_reachability_constraint(
-                        PredicateOrLiteral::Predicate(Predicate {
-                            node: PredicateNode::IsNonEmptyIterable(iter_expr),
-                            is_positive: true,
-                        }),
-                    );
+                let literal_iterable_is_non_empty = (!*is_async)
+                    .then(|| literal_iterable_truthiness(iter))
+                    .and_then(Truthiness::into_bool);
 
-                    Some((after_iter, constraint))
-                } else {
-                    self.record_ambiguous_reachability();
-                    None
-                };
+                let (after_empty_iter, non_empty_range_constraint) =
+                    match literal_iterable_is_non_empty {
+                        Some(false) => {
+                            let after_iter = self.flow_snapshot();
+                            self.mark_unreachable();
+                            (Some(after_iter), None)
+                        }
+                        Some(true) => (None, None),
+                        None if is_direct_range_call(iter) => {
+                            let after_iter = self.flow_snapshot();
+                            let constraint = self.record_reachability_constraint(
+                                PredicateOrLiteral::Predicate(Predicate {
+                                    node: PredicateNode::IsNonEmptyIterable(iter_expr),
+                                    is_positive: true,
+                                }),
+                            );
+
+                            (None, Some((after_iter, constraint)))
+                        }
+                        None => {
+                            self.record_ambiguous_reachability();
+                            (None, None)
+                        }
+                    };
 
                 let pre_loop = self.flow_snapshot();
 
@@ -3534,17 +3560,23 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     self.populate_loop_header(&bound_place_ids, header_id, loop_min_definition_id);
                 }
 
-                // We may execute the `else` clause without ever executing the body, so merge in a
-                // zero-iteration state before visiting `else`.
-                if let Some((after_iter, non_empty_range_constraint)) = non_empty_range_constraint {
-                    let post_loop_body = self.flow_snapshot();
+                if let Some(after_iter) = after_empty_iter {
                     self.flow_restore(after_iter);
-                    self.record_negated_reachability_constraint(non_empty_range_constraint);
-                    let no_iteration = self.flow_snapshot();
-                    self.flow_restore(post_loop_body);
-                    self.flow_merge(no_iteration);
-                } else {
-                    self.flow_merge(pre_loop);
+                } else if literal_iterable_is_non_empty.is_none() {
+                    // We may execute the `else` clause without ever executing the body, so merge
+                    // in a zero-iteration state before visiting `else`.
+                    if let Some((after_iter, non_empty_range_constraint)) =
+                        non_empty_range_constraint
+                    {
+                        let post_loop_body = self.flow_snapshot();
+                        self.flow_restore(after_iter);
+                        self.record_negated_reachability_constraint(non_empty_range_constraint);
+                        let no_iteration = self.flow_snapshot();
+                        self.flow_restore(post_loop_body);
+                        self.flow_merge(no_iteration);
+                    } else {
+                        self.flow_merge(pre_loop);
+                    }
                 }
                 self.visit_body(orelse);
 
@@ -5051,6 +5083,22 @@ impl ExpressionsScopeMapBuilder {
         interval_map.push((range, current_scope));
 
         ExpressionsScopeMap(interval_map.into_boxed_slice())
+    }
+}
+
+/// Returns the static truthiness of a literal iterable.
+///
+/// Returns [`Truthiness::Unknown`] for other expressions and when starred elements or dictionary
+/// unpacking make the literal's emptiness ambiguous.
+fn literal_iterable_truthiness(expr: &ast::Expr) -> Truthiness {
+    match expr {
+        ast::Expr::Tuple(_)
+        | ast::Expr::List(_)
+        | ast::Expr::Set(_)
+        | ast::Expr::Dict(_)
+        | ast::Expr::StringLiteral(_)
+        | ast::Expr::BytesLiteral(_) => Truthiness::from_expr(expr, |_| false),
+        _ => Truthiness::Unknown,
     }
 }
 

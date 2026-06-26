@@ -732,6 +732,464 @@ def test_match_class_alias_rejects_disjoint_final_class(value: FinalA) -> None:
             reveal_type(item)  # revealed: Never
 ```
 
+## Exhaustive positional patterns for built-in classes
+
+Python defines a fixed set of built-in classes whose single positional subpattern receives the
+entire subject. The `float` element also handles `int`, which is assignable to `float` but is not a
+`float` instance at runtime:
+
+```py
+def builtin_positional_patterns_are_exhaustive(
+    value: tuple[
+        bool,
+        bytearray,
+        bytes,
+        dict[object, object],
+        float,
+        frozenset[object],
+        int,
+        list[object],
+        set[object],
+        str,
+        tuple[object, ...],
+    ],
+) -> int:
+    match value:
+        case (
+            bool(_),
+            bytearray(_),
+            bytes(_),
+            dict(_),
+            (int(_) | float(_)),
+            frozenset(_),
+            int(_),
+            list(_),
+            set(_),
+            str(_),
+            tuple(_),
+        ):
+            return 1
+```
+
+## `TypedDict` class patterns at runtime
+
+A `TypedDict` value is a dictionary at runtime, so argumentless `dict` and `Mapping` patterns always
+match it. The positional `dict` pattern does as well. This also applies when the subject is a
+truthiness-narrowed intersection or a type variable bounded by or constrained to `TypedDict`s:
+
+```py
+from collections.abc import Mapping
+from typing import TypeVar, TypedDict
+
+class Movie(TypedDict):
+    title: str
+
+class OptionalMovie(TypedDict, total=False):
+    title: str
+
+class Series(TypedDict):
+    seasons: int
+
+T = TypeVar("T", bound=Movie)
+U = TypeVar("U", Movie, Series)
+
+def argumentless_dict_pattern_is_exhaustive(value: Movie) -> int:
+    match value:
+        case dict():
+            return 1
+
+def mapping_pattern_is_exhaustive(value: Movie) -> int:
+    match value:
+        case Mapping():
+            return 1
+
+def positional_dict_pattern_is_exhaustive(value: Movie) -> int:
+    match value:
+        case dict(_):
+            return 1
+
+def narrowed_typed_dict_pattern_is_exhaustive(value: OptionalMovie) -> int:
+    if not value:
+        return 0
+    match value:
+        case dict():
+            return 1
+
+def bounded_typed_dict_pattern_is_exhaustive(value: T) -> int:
+    match value:
+        case dict():
+            return 1
+
+def constrained_typed_dict_pattern_is_exhaustive(value: U) -> int:
+    match value:
+        case dict():
+            return 1
+```
+
+## Required `TypedDict` keys
+
+A mapping pattern is exhaustive for a `TypedDict` when every key in the pattern names a required
+field and every value pattern matches all values allowed for that field. The negative cases below
+exercise three separate checks: an optional field, an unknown key, and a non-string key.
+
+```py
+from typing import Any, Literal, Protocol, TypeVar, TypedDict
+from ty_extensions import Intersection, Unknown
+
+class RequiredPayload(TypedDict):
+    tag: Literal["int"]
+    value: int
+
+class OptionalPayload(TypedDict, total=False):
+    value: int
+
+class DynamicPayload(TypedDict):
+    any_value: Any
+    unknown_value: Unknown
+
+class AlternatePayload(TypedDict):
+    tag: Literal["int"]
+    value: int
+
+class Marker(Protocol):
+    marker: int
+
+P = TypeVar("P", bound=RequiredPayload)
+Q = TypeVar("Q", RequiredPayload, AlternatePayload)
+
+def required_typed_dict_keys_are_exhaustive(value: RequiredPayload) -> int:
+    match value:
+        case {"tag": "int", "value": int()}:
+            return 1
+
+def universal_nested_patterns_are_exhaustive(value: DynamicPayload) -> int:
+    match value:
+        case {"any_value": object(), "unknown_value": object()}:
+            return 1
+
+def bounded_typed_dict_mapping_is_exhaustive(value: P) -> int:
+    match value:
+        case {"tag": "int", "value": int()}:
+            return 1
+
+def constrained_typed_dict_mapping_is_exhaustive(value: Q) -> int:
+    match value:
+        case {"tag": "int", "value": int()}:
+            return 1
+
+def intersected_typed_dict_mapping_is_exhaustive(
+    value: Intersection[RequiredPayload, Marker],
+) -> int:
+    match value:
+        case {"tag": "int", "value": int()}:
+            return 1
+
+def optional_key_is_not_exhaustive(
+    value: OptionalPayload,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case {"value": _}:
+            return 1
+
+def absent_key_is_not_exhaustive(
+    value: RequiredPayload,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case {"missing": _}:
+            return 1
+
+def non_string_key_is_not_exhaustive(
+    value: RequiredPayload,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case {1: _}:
+            return 1
+```
+
+## `NamedTuple` positional patterns
+
+A `NamedTuple` provides a generated `__match_args__` tuple containing all of its fields:
+
+```py
+from typing import NamedTuple
+
+class NamedPoint(NamedTuple):
+    x: int
+    label: str
+
+def named_tuple_positional_pattern_is_exhaustive(value: NamedPoint) -> int:
+    match value:
+        case NamedPoint(_, _):
+            return 1
+```
+
+## Positional patterns for built-in subclasses
+
+Subclasses inherit this positional behavior. The positional subpattern still needs to match the
+entire value, so a literal subpattern is not exhaustive:
+
+```py
+class MyInt(int): ...
+
+def builtin_subclass_positional_pattern_is_exhaustive(value: MyInt) -> int:
+    match value:
+        case MyInt(_):
+            return 1
+
+def builtin_positional_literal_is_not_exhaustive(
+    value: MyInt,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case MyInt(0):
+            return 1
+```
+
+## Resolving `__match_args__`
+
+For other positional class patterns, Python reads `__match_args__` from the pattern class. A fixed
+tuple of attribute names makes the corresponding positional patterns exhaustive when every selected
+attribute is present on the subject:
+
+```py
+class KnownAttributes:
+    __match_args__ = ("x", "y")
+    x: int = 0
+    y: int = 0
+
+def fixed_match_args_are_exhaustive(value: KnownAttributes) -> int:
+    match value:
+        case KnownAttributes(_, _):
+            return 1
+
+class ValidMatchArgsMeta(type):
+    __match_args__ = ("x",)
+
+class WithMetaclassMatchArgs(metaclass=ValidMatchArgsMeta):
+    x: int = 0
+
+def metaclass_match_args_is_exhaustive(value: WithMetaclassMatchArgs) -> int:
+    match value:
+        case WithMetaclassMatchArgs(_):
+            return 1
+```
+
+The pattern is not exhaustive when a selected attribute is missing, an explicit annotation widens
+the tuple type, or a conditional definition can override a built-in class's usual positional
+behavior. A metaclass can also provide `__match_args__` that selects a missing attribute:
+
+```py
+class IntWithMissingMatchArg(int):
+    __match_args__ = ("missing",)
+
+def missing_match_arg_is_not_exhaustive(
+    value: IntWithMissingMatchArg,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case IntWithMissingMatchArg(_):
+            return 1
+
+class MatchArgsMeta(type):
+    __match_args__ = ("missing",)
+
+class IntWithMetaclassMatchArgs(int, metaclass=MatchArgsMeta): ...
+
+def metaclass_match_args_is_not_exhaustive(
+    value: IntWithMetaclassMatchArgs,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case IntWithMetaclassMatchArgs(_):
+            return 1
+
+class WidenedMatchArgs:
+    __match_args__: tuple[str, ...] = ("x",)
+    x: int = 0
+
+def widened_match_args_is_not_exhaustive(
+    value: WidenedMatchArgs,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case WidenedMatchArgs(_):
+            return 1
+
+def condition() -> bool:
+    return bool()
+
+flag = condition()
+
+class ConditionalIntMatchArgs(int):
+    if flag:
+        __match_args__ = ("missing",)
+
+def conditional_match_args_disables_builtin_behavior(
+    value: ConditionalIntMatchArgs,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case ConditionalIntMatchArgs(_):
+            return 1
+```
+
+## Properties and declared attributes
+
+Properties and declared attributes count as present when checking exhaustiveness, even though
+descriptor access can raise `AttributeError` and an annotated attribute can be absent at runtime:
+
+```py
+from typing import Literal
+
+class FallibleProperty:
+    @property
+    def x(self) -> Literal[1]:
+        raise AttributeError
+
+def fallible_property_value_pattern_is_statically_exhaustive(value: FallibleProperty) -> int:
+    match value:
+        case FallibleProperty(x=1):
+            return 1
+
+class DeclaredLiteralAttribute:
+    x: Literal[1]
+
+def declared_literal_attribute_is_exhaustive(
+    value: DeclaredLiteralAttribute,
+) -> int:
+    match value:
+        case DeclaredLiteralAttribute(x=1):
+            return 1
+```
+
+## Runtime-checkable protocol patterns
+
+Runtime-checkable protocols use the same rule. The subject below is known to provide `x`, so the
+pattern is exhaustive even though the subject class is not final:
+
+```py
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class RuntimeProtocolWithX(Protocol):
+    x: int
+
+class RuntimeProtocolImplementer:
+    x: int = 0
+
+def runtime_protocol_pattern_is_exhaustive(value: RuntimeProtocolImplementer) -> int:
+    match value:
+        case RuntimeProtocolWithX(x=_):
+            return 1
+```
+
+## Members from the subject type
+
+A keyword pattern reads the attribute from the matched value. The subject type can therefore provide
+an attribute that is not declared by the class named in the pattern. This also applies when the
+subject class is not final:
+
+```py
+class BaseWithoutX: ...
+
+class ChildWithX(BaseWithoutX):
+    x: int = 0
+
+def subclass_member_is_exhaustive(value: ChildWithX) -> int:
+    match value:
+        case BaseWithoutX(x=_):
+            return 1
+```
+
+## Positional behavior comes from the pattern class
+
+Only the class named in the pattern determines what a positional subpattern receives. Although
+`IntPlainChild` also inherits from `int`, `PlainBase(_)` does not receive the whole value:
+
+```py
+class PlainBase: ...
+class IntPlainChild(int, PlainBase): ...
+
+def builtin_positional_behavior_comes_from_pattern_class(
+    value: IntPlainChild,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case PlainBase(_):
+            return 1
+```
+
+## Nested class patterns
+
+The same rule applies recursively: every nested pattern must match every value allowed for the
+attribute it receives.
+
+```py
+class Inner:
+    x: int = 0
+
+class Outer:
+    inner: Inner = Inner()
+
+def nested_class_subpattern_is_exhaustive(value: tuple[Outer]) -> int:
+    match value:
+        case [Outer(inner=Inner(x=_))]:
+            return 1
+```
+
+## Missing class-pattern attributes
+
+A class pattern can fail after its `isinstance` check if a requested attribute is missing or only
+conditionally defined. This applies to both keyword and positional attributes, including inside a
+sequence. The failed branch therefore keeps the original subject type:
+
+```py
+from typing import final
+
+class MissingAttributes:
+    __match_args__ = ("x", "missing")
+    x: int = 0
+
+class OtherClass: ...
+
+def missing_attribute_keeps_original_subject(
+    value: MissingAttributes | OtherClass,
+) -> None:
+    match value:
+        case MissingAttributes(missing=_):
+            pass
+        case _:
+            reveal_type(value)  # revealed: MissingAttributes | OtherClass
+
+def missing_positional_attribute_keeps_sequence_possible(
+    value: tuple[MissingAttributes],
+) -> None:
+    match value:
+        case [MissingAttributes(_, _)]:
+            pass
+        case _:
+            reveal_type(value)  # revealed: tuple[MissingAttributes]
+
+def attribute_condition() -> bool:
+    return bool()
+
+@final
+class PossiblyMissingAttribute:
+    if attribute_condition():
+        x: int = 0
+
+def possibly_missing_attribute_is_not_exhaustive(
+    value: PossiblyMissingAttribute,
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case PossiblyMissingAttribute(x=_):
+            return 1
+```
+
 ## Sequence exhaustiveness
 
 Sequence patterns also contribute to negative narrowing and exhaustiveness. Exact tuple shapes can
@@ -739,6 +1197,9 @@ make a match exhaustive.
 
 ```py
 from typing_extensions import assert_never
+
+class HasX:
+    x: int = 0
 
 def test_match_exact_tuple_sequence(subj: tuple[int | str, int | str]) -> None:
     match subj:
@@ -769,6 +1230,15 @@ def test_match_exact_tuple_sequence_is_exhaustive(value: int | tuple[int, int]) 
             return left + right
         case _:
             assert_never(value)
+
+# Matching the element would succeed, but a one-element pattern cannot match a two-element tuple.
+def sequence_length_is_still_checked(
+    value: tuple[HasX, HasX],
+    # error: [invalid-return-type]
+) -> int:
+    match value:
+        case [HasX(x=_)]:
+            return 1
 
 def test_match_exact_tuple_element_union_is_exhaustive(x: tuple[int | str]) -> int:
     match x:
