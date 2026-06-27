@@ -44,9 +44,9 @@ use crate::place::{
 };
 use crate::predicate::{
     CallableAndCallExpr, ClassPatternKeywordPredicateKind, ClassPatternPredicateKind,
-    MappingPatternEntryPredicateKind, PatternPredicate, PatternPredicateKind, Predicate,
-    PredicateNode, PredicateOrLiteral, ScopedPredicateId, SequencePatternPredicateKind,
-    StarImportPlaceholderPredicate, SubjectElementPatternPredicate,
+    MappingPatternEntryPredicateKind, MappingPatternPredicateKind, PatternPredicate,
+    PatternPredicateKind, Predicate, PredicateNode, PredicateOrLiteral, ScopedPredicateId,
+    SequencePatternPredicateKind, StarImportPlaceholderPredicate, SubjectElementPatternPredicate,
 };
 use crate::program::Program;
 use crate::re_exports::exported_names;
@@ -277,9 +277,9 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     seen_submodule_imports: FxHashSet<String>,
     // A map from a lambda expression to its enclosing statement.
     enclosing_lambda_statements: FxHashMap<ExpressionNodeKey, Statement<'db>>,
-    // A map from a constraining use of a collection literal to its definition.
+    // A map from a constraining use of a collection initializer to its definition.
     collections_by_use: FxHashMap<ExpressionNodeKey, Definition<'db>>,
-    // A map from a collection literal definition to statements containing a constraining use.
+    // A map from a collection initializer definition to statements containing a constraining use.
     uses_by_collection: FxHashMap<Definition<'db>, Vec<(Statement<'db>, ExpressionNodeKey)>>,
     /// Hashset of all [`FileScopeId`]s that correspond to [generator functions].
     ///
@@ -1093,9 +1093,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         &mut self.ast_ids[scope_id]
     }
 
-    /// If the given expression is a use of an unannotated collection literal, returns
-    /// the definition of the collection literal.
-    fn unannotated_collection_literal_binding(
+    /// If the given expression is a use of an unannotated collection initializer, returns
+    /// the definition of the initializer.
+    fn unannotated_collection_initializer_binding(
         &self,
         collection_use: &ast::Expr,
     ) -> Option<Definition<'db>> {
@@ -1109,12 +1109,26 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 definition
                     .kind(self.db)
                     .as_unannotated_assignment()
-                    .is_some_and(|assignment| is_collection_literal(assignment.value(self.module)))
+                    .is_some_and(|assignment| {
+                        is_collection_initializer(assignment.value(self.module))
+                    })
             })
             // TODO: Support uses that refer to multiple definitions. This currently seems to lead to
             // cycle-related panics.
             .exactly_one()
             .ok()
+    }
+
+    fn unannotated_collection_literal_binding(
+        &self,
+        collection_use: &ast::Expr,
+    ) -> Option<Definition<'db>> {
+        let definition = self.unannotated_collection_initializer_binding(collection_use)?;
+        definition
+            .kind(self.db)
+            .as_unannotated_assignment()
+            .is_some_and(|assignment| is_collection_literal(assignment.value(self.module)))
+            .then_some(definition)
     }
 
     /// Try to register a narrowing alias for a simple name assignment.
@@ -2063,8 +2077,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             }
             ast::Pattern::MatchMapping(pattern) => {
                 // Retain keyed entries for subject-aware exhaustiveness analysis.
-                PatternPredicateKind::Mapping(
-                    pattern
+                PatternPredicateKind::Mapping(MappingPatternPredicateKind {
+                    entries: pattern
                         .keys
                         .iter()
                         .zip(&pattern.patterns)
@@ -2073,7 +2087,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                             pattern: self.predicate_kind(pattern),
                         })
                         .collect(),
-                )
+                    rest: pattern.rest.as_ref().map(|name| name.id.clone()),
+                })
             }
             ast::Pattern::MatchSequence(pattern) => {
                 PatternPredicateKind::Sequence(SequencePatternPredicateKind {
@@ -2606,24 +2621,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
         assert_eq!(&self.current_assignments, &[]);
 
-        let mut place_tables: IndexVec<_, _> = self
-            .place_tables
-            .into_iter()
-            .map(|builder| Arc::new(builder.finish()))
-            .collect();
-
-        let mut use_def_maps: IndexVec<_, _> = self
-            .use_def_maps
-            .into_iter()
-            .map(|builder| Arc::new(builder.finish()))
-            .collect();
-
         let ast_ids = super::ast_ids::AstIds::from_builders(self.ast_ids);
 
-        self.scopes.shrink_to_fit();
-        place_tables.shrink_to_fit();
-        use_def_maps.shrink_to_fit();
-        self.scope_ids_by_scope.shrink_to_fit();
         let mut semantic_syntax_errors = self.semantic_syntax_errors.into_inner();
         semantic_syntax_errors.shrink_to_fit();
         let uses_by_collection = FrozenMap::from_entries(
@@ -2634,7 +2633,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         );
 
         SemanticIndex {
-            place_tables: place_tables.into(),
+            place_tables: self
+                .place_tables
+                .into_iter()
+                .map(|builder| Arc::new(builder.finish()))
+                .collect(),
             scopes: self.scopes.into(),
             definitions_by_node: DefinitionsByNode::from_map(self.definitions_by_node),
             expressions_by_node: self.expressions_by_node,
@@ -2644,7 +2647,11 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             ast_ids,
             scopes_by_expression: self.scopes_by_expression.build(),
             scopes_by_node: self.scopes_by_node,
-            use_def_maps: use_def_maps.into(),
+            use_def_maps: self
+                .use_def_maps
+                .into_iter()
+                .map(|builder| Arc::new(builder.finish()))
+                .collect(),
             enclosing_lambda_statements: FrozenMap::from(self.enclosing_lambda_statements),
             collections_by_use: FrozenMap::from(self.collections_by_use),
             uses_by_collection,
@@ -3138,9 +3145,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
                 self.visit_expr(&node.value);
 
-                // Unannotated collection literals must be standalone expressions to participate
+                // Unannotated collection initializers must be standalone expressions to participate
                 // in full-scope bidirectional inference.
-                if node.targets.len() == 1 && is_collection_literal(&node.value) {
+                if node.targets.len() == 1 && is_collection_initializer(&node.value) {
                     self.add_standalone_assigned_expression(&node.value, node);
                 }
 
@@ -4125,7 +4132,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     // significant performance regressions.
                     //
                     // Note that built-in collection types do not have methods that explicitly
-                    // return `Never`, so does not have a meaningful semantic impact, except in
+                    // return `Never`, so this does not have a meaningful semantic impact, except in
                     // the rare case where a collection is explicitly marked as having elements
                     // of type `Never`.
                     if !self.source_type.is_stub()
@@ -4190,7 +4197,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
         let mut current_statement = self.pop_statement();
 
         // We currently only consider certain types of statements to introduce constraints
-        // on collection literals. This restriction is mostly for performance reasons, as we
+        // on collection initializers. This restriction is mostly for performance reasons, as we
         // want to avoid "reads" of a collection contributing to the complexity of the cycles
         // created by full-scope collection inference.
         current_statement
@@ -4250,7 +4257,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 .map(|lambda| (lambda.into(), standalone_statement)),
         );
 
-        // The inferred element type of collection literal depends on uses of
+        // The inferred element type of a collection initializer depends on uses of
         // the collection in its containing scope, and so each use must be part
         // of an standalone inferable statement to avoid large scope-level cycles.
         let mut collection_defs = FxHashSet::default();
@@ -4378,9 +4385,9 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                     if is_use {
                         self.record_place_use(place_id, expr);
 
-                        // Keep track of any uses of unannotated collection literals.
+                        // Keep track of any uses of unannotated collection initializers.
                         if let Some(collection_def) =
-                            self.unannotated_collection_literal_binding(expr)
+                            self.unannotated_collection_initializer_binding(expr)
                             && let Some(current_statement) = self.current_statements.last_mut()
                         {
                             current_statement
@@ -5123,6 +5130,24 @@ fn is_if_not_type_checking(expr: &ast::Expr) -> bool {
             ..
         }) if is_if_type_checking(operand)
     )
+}
+
+fn is_empty_collection_constructor_call(expr: &ast::Expr) -> bool {
+    let ast::Expr::Call(ast::ExprCall {
+        func, arguments, ..
+    }) = expr
+    else {
+        return false;
+    };
+
+    arguments.is_empty()
+        && func
+            .as_name_expr()
+            .is_some_and(|name| matches!(name.id.as_str(), "list" | "set" | "dict"))
+}
+
+fn is_collection_initializer(expr: &ast::Expr) -> bool {
+    is_collection_literal(expr) || is_empty_collection_constructor_call(expr)
 }
 
 pub(crate) fn is_collection_literal(expr: &ast::Expr) -> bool {
