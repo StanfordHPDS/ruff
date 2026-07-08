@@ -95,8 +95,8 @@ pub use crate::types::type_form::TypeFormType;
 pub(crate) use crate::types::typed_dict::TypedDictType;
 use crate::types::typevar::TypeVarInstance;
 pub use crate::types::typevar::{
-    BindingContext, BoundTypeVarInstance, ParamSpecAttrKind, TypeVarBoundOrConstraints,
-    TypeVarKind, TypeVarNonce,
+    BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance, ParamSpecAttrKind,
+    TypeVarBoundOrConstraints, TypeVarKind, TypeVarNonce,
 };
 pub use crate::types::variance::TypeVarVariance;
 use crate::types::variance::VarianceInferable;
@@ -2461,7 +2461,9 @@ impl<'db> Type<'db> {
             Type::KnownInstance(KnownInstanceType::Range { is_non_empty }) => !is_non_empty,
 
             // Each `partial()` call creates a distinct object at runtime.
-            Type::KnownInstance(KnownInstanceType::FunctoolsPartial(_)) => false,
+            Type::KnownInstance(
+                KnownInstanceType::FunctoolsPartial(_) | KnownInstanceType::FunctoolsPartialCall(_),
+            ) => false,
 
             Type::FunctionLiteral(..)
             | Type::WrapperDescriptor(_)
@@ -3993,7 +3995,16 @@ impl<'db> Type<'db> {
                 Type::KnownInstance(KnownInstanceType::FunctoolsPartial(partial))
                     if name_str == "__call__" =>
                 {
-                    Place::bound(Type::Callable(partial.partial(db))).into()
+                    Place::bound(Type::KnownInstance(
+                        KnownInstanceType::FunctoolsPartialCall(partial),
+                    ))
+                    .into()
+                }
+
+                Type::KnownInstance(KnownInstanceType::FunctoolsPartialCall(_))
+                    if name_str == "__call__" =>
+                {
+                    Place::bound(this).into()
                 }
 
                 Type::KnownInstance(KnownInstanceType::FunctoolsPartial(partial)) => {
@@ -4621,9 +4632,10 @@ impl<'db> Type<'db> {
             )
             .into(),
 
-            Type::KnownInstance(KnownInstanceType::FunctoolsPartial(partial)) => {
-                Type::Callable(partial.partial(db)).bindings(db)
-            }
+            Type::KnownInstance(
+                KnownInstanceType::FunctoolsPartial(partial)
+                | KnownInstanceType::FunctoolsPartialCall(partial),
+            ) => Type::Callable(partial.partial(db)).bindings(db),
 
             Type::KnownInstance(known_instance) => {
                 known_instance.instance_fallback(db).bindings(db)
@@ -5842,14 +5854,14 @@ impl<'db> Type<'db> {
                 KnownInstanceType::Sentinel(sentinel) => {
                     Ok(Type::KnownInstance(KnownInstanceType::Sentinel(*sentinel)))
                 }
-                KnownInstanceType::FunctoolsPartial(_) | KnownInstanceType::Range { .. } => {
-                    Err(InvalidTypeExpressionError {
-                        invalid_expressions: smallvec_inline![InvalidTypeExpression::InvalidType(
-                            *self, scope_id
-                        )],
-                        fallback_type: Type::unknown(),
-                    })
-                }
+                KnownInstanceType::FunctoolsPartial(_)
+                | KnownInstanceType::FunctoolsPartialCall(_)
+                | KnownInstanceType::Range { .. } => Err(InvalidTypeExpressionError {
+                    invalid_expressions: smallvec_inline![InvalidTypeExpression::InvalidType(
+                        *self, scope_id
+                    )],
+                    fallback_type: Type::unknown(),
+                }),
             },
 
             Type::SpecialForm(special_form) => special_form
@@ -6693,7 +6705,8 @@ impl<'db> Type<'db> {
                 | KnownInstanceType::NewType(_)
                 | KnownInstanceType::Sentinel(_)
                 | KnownInstanceType::Range { .. }
-                | KnownInstanceType::FunctoolsPartial(_) => {
+                | KnownInstanceType::FunctoolsPartial(_)
+                | KnownInstanceType::FunctoolsPartialCall(_) => {
                     // TODO: For some of these, we may need to try to find legacy typevars in inner types.
                 }
             },
@@ -7247,10 +7260,10 @@ impl<'db> From<&Type<'db>> for Type<'db> {
 }
 
 impl<'db> VarianceInferable<'db> for Type<'db> {
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
+    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarIdentity<'db>) -> TypeVarVariance {
         tracing::trace!(
             "Checking variance of '{tvar}' in `{ty:?}`",
-            tvar = typevar.typevar(db).name(db),
+            tvar = typevar.identity.name(db),
             ty = self.display(db),
         );
 
@@ -7273,7 +7286,7 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
             Type::GenericAlias(generic_alias) => generic_alias.variance_of(db, typevar),
             Type::Callable(callable_type) => callable_type.signatures(db).variance_of(db, typevar),
             // A type variable is always covariant in itself.
-            Type::TypeVar(other_typevar) if other_typevar == typevar => {
+            Type::TypeVar(other_typevar) if other_typevar.identity(db) == typevar => {
                 // type variables are covariant in themselves
                 TypeVarVariance::Covariant
             }
@@ -7338,7 +7351,7 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
 
         tracing::trace!(
             "Result of variance of '{tvar}' in `{ty:?}` is `{v:?}`",
-            tvar = typevar.typevar(db).name(db),
+            tvar = typevar.identity.name(db),
             ty = self.display(db),
         );
         v
@@ -7899,11 +7912,11 @@ enum InvalidTypeExpression<'db> {
     Deprecated,
     /// Same for `dataclasses.Field`
     Field,
-    /// Same for `ty_extensions.ConstraintSet`
+    /// Same for `ty_extensions._internal.ConstraintSet`
     ConstraintSet,
-    /// Same for `ty_extensions.GenericContext`
+    /// Same for `ty_extensions._internal.GenericContext`
     GenericContext,
-    /// Same for `ty_extensions.Specialization`
+    /// Same for `ty_extensions._internal.Specialization`
     Specialization,
     /// Same for `NamedTupleSpec`
     NamedTupleSpec,
@@ -7967,17 +7980,17 @@ impl<'db> InvalidTypeExpression<'db> {
                     }
                     InvalidTypeExpression::ConstraintSet => write!(
                         f,
-                        "`ty_extensions.ConstraintSet` is not allowed in {location}s",
+                        "`ty_extensions._internal.ConstraintSet` is not allowed in {location}s",
                     ),
                     InvalidTypeExpression::GenericContext => {
                         write!(
                             f,
-                            "`ty_extensions.GenericContext` is not allowed in {location}s"
+                            "`ty_extensions._internal.GenericContext` is not allowed in {location}s"
                         )
                     }
                     InvalidTypeExpression::Specialization => write!(
                         f,
-                        "`ty_extensions.GenericContext` is not allowed in {location}s",
+                        "`ty_extensions._internal.Specialization` is not allowed in {location}s",
                     ),
                     InvalidTypeExpression::NamedTupleSpec => {
                         write!(f, "`NamedTupleSpec` is not allowed in {location}s")
@@ -8505,7 +8518,7 @@ impl<'db> TypeIsType<'db> {
 impl<'db> VarianceInferable<'db> for TypeIsType<'db> {
     // See the [typing spec] on why `TypeIs` is invariant in its type.
     // [typing spec]: https://typing.python.org/en/latest/spec/narrowing.html#typeis
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
+    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarIdentity<'db>) -> TypeVarVariance {
         self.type_argument(db)
             .with_polarity(TypeVarVariance::Invariant)
             .variance_of(db, typevar)
@@ -8575,7 +8588,7 @@ impl<'db> TypeGuardType<'db> {
 impl<'db> VarianceInferable<'db> for TypeGuardType<'db> {
     // `TypeGuard` is covariant in its type parameter. See the `TypeGuard`
     // section of mdtest/generics/pep695/variance.md for details.
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
+    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarIdentity<'db>) -> TypeVarVariance {
         self.return_type(db).variance_of(db, typevar)
     }
 }

@@ -24,19 +24,21 @@ use crate::types::constraints::{
 };
 use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::generics::{
-    ApplySpecialization, GenericContext, InferableTypeVars, Specialization, walk_generic_context,
+    ApplySpecialization, GenericContext, InferableTypeVars, Specialization, TypeVarInference,
+    walk_generic_context,
 };
 use crate::types::infer::{TypeExpressionFlags, infer_deferred_types};
 use crate::types::relation::{
     HasRelationToVisitor, IsDisjointVisitor, TypeRelation, TypeRelationChecker, TypeVarEvaluation,
 };
 use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation;
-use crate::types::typevar::{BoundTypeVarIdentity, max_typevar_freshness_matching_generic_context};
+use crate::types::typevar::max_typevar_freshness_matching_generic_context;
 use crate::types::{
-    ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType, ErrorContext,
-    ErrorContextTree, FindLegacyTypeVarsVisitor, KnownClass, MaterializationKind,
-    ParamSpecAttrKind, ParameterDescription, SelfBinding, TypeContext, TypeMapping, TypeVarNonce,
-    TypedDictType, UnionBuilder, VarianceInferable, infer_complete_scope_types, todo_type,
+    ApplyTypeMappingVisitor, BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance,
+    CallableType, ErrorContext, ErrorContextTree, FindLegacyTypeVarsVisitor, KnownClass,
+    MaterializationKind, ParamSpecAttrKind, ParameterDescription, SelfBinding, TypeContext,
+    TypeMapping, TypeVarNonce, TypedDictType, UnionBuilder, VarianceInferable,
+    infer_complete_scope_types, todo_type,
 };
 use crate::{Db, FxOrderSet};
 use ruff_python_ast::{self as ast, name::Name};
@@ -111,7 +113,7 @@ pub struct CallableSignature<'db> {
 pub(crate) struct PartialSignatureApplication<'db> {
     signature: Signature<'db>,
     partial_application: PartialApplication<'db>,
-    specialization: Option<Specialization<'db>>,
+    inference: Option<TypeVarInference<'db>>,
     unspecialized_return_ty: Type<'db>,
 }
 
@@ -120,13 +122,13 @@ impl<'db> PartialSignatureApplication<'db> {
     pub(crate) fn new(
         signature: Signature<'db>,
         partial_application: PartialApplication<'db>,
-        specialization: Option<Specialization<'db>>,
+        inference: Option<TypeVarInference<'db>>,
         unspecialized_return_ty: Type<'db>,
     ) -> Self {
         Self {
             signature,
             partial_application,
-            specialization,
+            inference,
             unspecialized_return_ty,
         }
     }
@@ -209,7 +211,7 @@ impl<'db> CallableSignature<'db> {
             let signature = overload.signature.partially_apply(
                 db,
                 &overload.partial_application,
-                overload.specialization,
+                overload.inference,
                 overload.unspecialized_return_ty,
             );
             let dedup_key = signature.clone().with_definition(None);
@@ -460,7 +462,7 @@ impl<'a, 'db> IntoIterator for &'a CallableSignature<'db> {
 
 impl<'db> VarianceInferable<'db> for &CallableSignature<'db> {
     // TODO: possibly need to replace self
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
+    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarIdentity<'db>) -> TypeVarVariance {
         self.overloads
             .iter()
             .map(|signature| signature.variance_of(db, typevar))
@@ -1091,23 +1093,20 @@ impl<'db> Signature<'db> {
         &self,
         db: &'db dyn Db,
         partial_application: &PartialApplication<'db>,
-        specialization: Option<Specialization<'db>>,
+        inference: Option<TypeVarInference<'db>>,
         unspecialized_return_ty: Type<'db>,
     ) -> Self {
         let signature_specialization =
-            self.partial_application_specialization(db, partial_application, specialization);
+            self.partial_application_specialization(db, partial_application, inference);
         let signature = signature_specialization.map_or_else(
             || self.clone(),
             |specialization| self.apply_specialization(db, specialization),
         );
 
         let parameters = signature.parameters().as_slice();
-        let return_ty = specialization.map_or_else(
+        let return_ty = signature_specialization.map_or_else(
             || unspecialized_return_ty,
-            |specialization| {
-                unspecialized_return_ty
-                    .apply_specialization(db, signature_specialization.unwrap_or(specialization))
-            },
+            |specialization| unspecialized_return_ty.apply_specialization(db, specialization),
         );
 
         let mut remaining = Vec::with_capacity(parameters.len());
@@ -1179,12 +1178,12 @@ impl<'db> Signature<'db> {
         &self,
         db: &'db dyn Db,
         partial_application: &PartialApplication<'db>,
-        specialization: Option<Specialization<'db>>,
+        inference: Option<TypeVarInference<'db>>,
     ) -> Option<Specialization<'db>> {
-        let specialization = specialization?;
-        let Some(generic_context) = self.generic_context else {
-            return Some(specialization);
-        };
+        let inference = inference?;
+        let generic_context = self
+            .generic_context
+            .unwrap_or_else(|| inference.generic_context(db));
 
         let promoted_typevars: FxHashSet<BoundTypeVarIdentity<'db>> = generic_context
             .variables(db)
@@ -1203,22 +1202,14 @@ impl<'db> Signature<'db> {
             .collect();
 
         if promoted_typevars.is_empty() {
-            return Some(specialization);
+            return Some(inference.specialization(db));
         }
 
-        Some(generic_context.specialize_recursive(
-            db,
-            generic_context.variables(db).map(|typevar| {
-                let ty = specialization
-                    .get(db, typevar)
-                    .unwrap_or(Type::TypeVar(typevar));
-                Some(if promoted_typevars.contains(&typevar.identity(db)) {
-                    ty.promote(db)
-                } else {
-                    ty
-                })
-            }),
-        ))
+        Some(inference.specialization_with(db, |typevar, inferred| {
+            promoted_typevars
+                .contains(&typevar.identity(db))
+                .then(|| inferred.map_or(Type::TypeVar(typevar), |ty| ty.promote(db)))
+        }))
     }
 
     fn needs_self_mapping(&self, db: &'db dyn Db, receiver_is_removed: bool) -> bool {
@@ -1405,10 +1396,10 @@ impl<'db> Signature<'db> {
 }
 
 impl<'db> VarianceInferable<'db> for &Signature<'db> {
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
+    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarIdentity<'db>) -> TypeVarVariance {
         tracing::trace!(
             "Checking variance of `{tvar}` in `{self:?}`",
-            tvar = typevar.typevar(db).name(db)
+            tvar = typevar.identity.name(db)
         );
 
         let parameter_variance = |parameter: &Parameter<'db>| {
@@ -1890,14 +1881,15 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 target_positional > source_positional || target.parameters.variadic().is_some();
 
             if target_accepts_extra_positionals {
-                if target_positional > source_positional
+                if let Some(context) = self.report_context()
+                    && target_positional > source_positional
                     && let Some(ParameterKind::KeywordOnly { name, .. }) = source
                         .parameters
                         .iter()
                         .nth(source_positional)
                         .map(Parameter::kind)
                 {
-                    self.provide_context(|| ErrorContext::ParameterMustAcceptPositionalArguments {
+                    context.push(ErrorContext::ParameterMustAcceptPositionalArguments {
                         name: name.clone(),
                     });
                 }
@@ -1915,8 +1907,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let return_type_checks = !result
             .intersect(db, self.constraints, return_type_constraints)
             .is_never_satisfied(db);
-        if !return_type_checks {
-            self.provide_context(|| ErrorContext::IncompatibleReturnTypes {
+        if let Some(context) = self.report_context()
+            && !return_type_checks
+        {
+            context.push(ErrorContext::IncompatibleReturnTypes {
                 source: source.return_ty,
                 target: target.return_ty,
             });
@@ -1949,9 +1943,11 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             }
 
             let constraint_set = self.check_type_pair(db, target_ty, source_ty);
-            if constraint_set.is_never_satisfied(db) {
+            if let Some(context) = self.report_context()
+                && constraint_set.is_never_satisfied(db)
+            {
                 let parameter = ParameterDescription::new(target_index, target_name);
-                self.provide_context(|| ErrorContext::IncompatibleParameterTypes {
+                context.push(ErrorContext::IncompatibleParameterTypes {
                     source: source_ty,
                     target: target_ty,
                     parameter,
@@ -2111,10 +2107,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                                 },
                             ) => {
                                 if self_name != other_name {
-                                    self.provide_context(|| ErrorContext::ParameterNameMismatch {
-                                        source_name: self_name.clone(),
-                                        target_name: other_name.clone(),
-                                    });
+                                    if let Some(context) = self.report_context() {
+                                        context.push(ErrorContext::ParameterNameMismatch {
+                                            source_name: self_name.clone(),
+                                            target_name: other_name.clone(),
+                                        });
+                                    }
                                     return self.never();
                                 }
                                 // The following checks are the same as positional-only parameters.
@@ -2772,11 +2770,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         // `target`, then the non-variadic parameters in `source` must have a default
                         // value.
                         if default_type.is_none() {
-                            let parameter =
-                                ParameterDescription::new(target_index, source_parameter.name());
-                            self.provide_context(|| ErrorContext::ExtraRequiredParameter {
-                                parameter,
-                            });
+                            if let Some(context) = self.report_context() {
+                                let parameter = ParameterDescription::new(
+                                    target_index,
+                                    source_parameter.name(),
+                                );
+                                context.push(ErrorContext::ExtraRequiredParameter { parameter });
+                            }
                             return self.never();
                         }
                     }
@@ -2832,10 +2832,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             },
                         ) => {
                             if source_name != target_name {
-                                self.provide_context(|| ErrorContext::ParameterNameMismatch {
-                                    source_name: source_name.clone(),
-                                    target_name: target_name.clone(),
-                                });
+                                if let Some(context) = self.report_context() {
+                                    context.push(ErrorContext::ParameterNameMismatch {
+                                        source_name: source_name.clone(),
+                                        target_name: target_name.clone(),
+                                    });
+                                }
                                 return self.never();
                             }
                             // The following checks are the same as positional-only parameters.
@@ -2926,12 +2928,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                                 name: target_name, ..
                             },
                         ) => {
-                            self.provide_context(|| {
-                                ErrorContext::ParameterMustAcceptKeywordArguments {
+                            if let Some(context) = self.report_context() {
+                                context.push(ErrorContext::ParameterMustAcceptKeywordArguments {
                                     source_name: name.clone(),
                                     target_name: target_name.clone(),
-                                }
-                            });
+                                });
+                            }
                             return self.never();
                         }
 
@@ -2940,11 +2942,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                             ParameterKind::PositionalOnly { .. }
                             | ParameterKind::PositionalOrKeyword { .. },
                         ) => {
-                            self.provide_context(|| {
-                                ErrorContext::ParameterMustAcceptPositionalArguments {
-                                    name: name.clone(),
-                                }
-                            });
+                            if let Some(context) = self.report_context() {
+                                context.push(
+                                    ErrorContext::ParameterMustAcceptPositionalArguments {
+                                        name: name.clone(),
+                                    },
+                                );
+                            }
                             return self.never();
                         }
 

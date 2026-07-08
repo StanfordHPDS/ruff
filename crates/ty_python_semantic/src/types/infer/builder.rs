@@ -3963,7 +3963,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             ));
                         }
                     }
-                    Some(CodeGeneratorKind::DataclassLike(_)) => match qualifier {
+                    Some(
+                        class_kind @ (CodeGeneratorKind::DataclassLike(_)
+                        | CodeGeneratorKind::Pydantic(_)),
+                    ) => match qualifier {
                         TypeQualifier::NotRequired
                         | TypeQualifier::ReadOnly
                         | TypeQualifier::Required => {
@@ -3972,9 +3975,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             else {
                                 continue;
                             };
+                            let field_kind = class_kind.name();
                             builder.into_diagnostic(format_args!(
-                                "`{name}` is not allowed in dataclass fields",
-                                name = qualifier.name()
+                                "`{name}` is not allowed in {field_kind} fields",
+                                name = qualifier.name(),
                             ));
                         }
                         TypeQualifier::ClassVar | TypeQualifier::Final | TypeQualifier::InitVar => {
@@ -8283,10 +8287,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     );
 
                 if call_result.is_ok() {
+                    let db = self.db();
                     for call_specialization in identity_bindings
                         .iter_flat()
                         .flat_map(CallableBinding::matching_overloads)
-                        .filter_map(|(_, identity_overload)| identity_overload.specialization())
+                        .filter_map(|(_, identity_overload)| identity_overload.specialization(db))
                     {
                         // Record the constraints on the receiver's generic context formed by
                         // the arguments to this bound method call.
