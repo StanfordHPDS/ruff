@@ -236,7 +236,14 @@ impl<'db> CodeGeneratorKind<'db> {
     pub(super) fn dataclass_transformer_params(self) -> Option<DataclassTransformerParams<'db>> {
         match self {
             Self::DataclassLike(params) => params,
-            Self::Pydantic(metadata) => Some(metadata.transformer_params()),
+            Self::Pydantic(_) | Self::NamedTuple | Self::TypedDict => None,
+        }
+    }
+
+    pub(super) fn field_specifiers(self, db: &'db dyn Db) -> Option<&'db [Type<'db>]> {
+        match self {
+            Self::DataclassLike(params) => Some(params?.field_specifiers(db)),
+            Self::Pydantic(metadata) => Some(metadata.field_specifiers(db)),
             Self::NamedTuple | Self::TypedDict => None,
         }
     }
@@ -2429,7 +2436,7 @@ pub(crate) enum FieldKind<'db> {
         /// The name for this field in the synthesized constructor signature, if specified.
         alias: Option<Box<str>>,
         /// The mode selected by Pydantic's `strict` argument.
-        strict: pydantic::StrictMode,
+        strict: pydantic::ConfigBoolean,
     },
     /// `TypedDict` field metadata
     TypedDict {

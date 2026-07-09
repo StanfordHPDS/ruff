@@ -92,8 +92,7 @@ class Person(BaseModel):
     name: str = Field(..., max_length=255)
 
 Person(name="Alice")
-# TODO: this should be an error
-Person()
+Person()  # error: [missing-argument]
 ```
 
 ## Strict and lax mode
@@ -623,16 +622,14 @@ class AliasAndName(BaseModel):
     name: int = Field(alias="alias")
 
 AliasAndName(alias=1)
-# TODO: no errors here
-# error: [missing-argument]
 AliasAndName(name=1)
+AliasAndName(name=None)  # error: [invalid-argument-type]
 ```
 
 Passing none of these should be an error:
 
 ```py
-# Note: this might be hard to support once we implement the feature above?
-# error: [missing-argument]
+# This is a known limitation, it should ideally be an error.
 AliasAndName()
 ```
 
@@ -644,11 +641,36 @@ class OnlyName(BaseModel):
 
     name: int = Field(alias="alias")
 
-# TODO: this should be an error
-OnlyName(alias=1)
-# TODO: no errors here
-# error: [missing-argument]
+OnlyName(alias=1)  # error: [missing-argument]
 OnlyName(name=1)
+```
+
+If `validate_by_alias=False` is set without specifying `validate_by_name`, Pydantic implicitly
+enables validation by name:
+
+```py
+class ImplicitlyOnlyName(BaseModel):
+    model_config = ConfigDict(validate_by_alias=False)
+
+    name: int = Field(alias="alias")
+
+ImplicitlyOnlyName(alias=1)  # error: [missing-argument]
+ImplicitlyOnlyName(name=1)
+```
+
+Pydantic models can also specify a `validation_alias` for a field, which takes precedence over
+`alias` when `validate_by_alias=True`:
+
+```py
+class ValidationAlias(BaseModel):
+    name: int = Field(alias="alias", validation_alias="validation_alias")
+
+ValidationAlias(validation_alias=1)
+ValidationAlias(validation_alias=None)  # error: [invalid-argument-type]
+
+ValidationAlias()  # error: [missing-argument]
+ValidationAlias(name=1)  # error: [missing-argument]
+ValidationAlias(alias=1)  # error: [missing-argument]
 ```
 
 ## Extra fields
@@ -707,6 +729,55 @@ reveal_type(PersonWithExtraField.__init__)
 PersonWithExtraField(extra=1, something_else=2)
 ```
 
+## Private attributes
+
+Underscore-prefixed attributes are considered private. They remain instance attributes but do not
+become model fields or constructor parameters:
+
+```py
+from pydantic import BaseModel, PrivateAttr
+
+class Person(BaseModel):
+    name: str
+    _implicit_private: int
+    _private_with_default: int = 1
+    _explicit_private: int = PrivateAttr(default=0)
+
+# revealed: (self: Person, *, name: LaxStr, **extra: Any) -> None
+reveal_type(Person.__init__)
+
+person = Person(name="Alice")
+reveal_type(person._implicit_private)  # revealed: int
+reveal_type(person._private_with_default)  # revealed: int
+reveal_type(person._explicit_private)  # revealed: int
+```
+
+## Using `Annotated` to specify field metadata
+
+`Annotated[T, Field(...)]` can be used to specify field metadata:
+
+```py
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Annotated
+
+class Person(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    name: Annotated[str, Field(strict=False)]
+    id: Annotated[int, Field(default=0)]
+
+Person(name="Alice", id=1)
+# TODO: This should not be an error
+# error: [invalid-argument-type]
+Person(name=b"Alice", id=1)
+# TODO: This should not be an error
+# error: [missing-argument]
+Person(name="Alice")
+
+Person(name=None, id=1)  # error: [invalid-argument-type]
+Person(id=1)  # error: [missing-argument]
+```
+
 ## Frozen models and fields
 
 There are various ways to make a field immutable. A model can be globally frozen using a class
@@ -731,8 +802,7 @@ class PersonFrozenName2(BaseModel):
     name: str
 
 person = PersonFrozenName2(name="Alice")
-# TODO: This should be an error
-person.name = "Bob"
+person.name = "Bob"  # error: [invalid-assignment]
 ```
 
 Finally, individual fields can also be made immutable on a non-frozen model:
@@ -746,6 +816,19 @@ person = PersonFrozenName3(name="Alice", age=20)
 # TODO: this should be an error
 person.name = "Bob"
 person.age += 1
+```
+
+No error is raised when a frozen model is subclassed. The child model is also frozen:
+
+```py
+class Base(BaseModel, frozen=True):
+    value: int
+
+class Derived(Base):
+    pass
+
+derived = Derived(value=1)
+derived.value = 2  # error: [invalid-assignment]
 ```
 
 ## Validation of default values
@@ -809,9 +892,11 @@ class Settings(BaseSettings):
     port: int
 
 # Would succeed at runtime if HOST and PORT environment variables are set
-# TODO: no error here
-# error: [missing-argument]
 Settings()
+Settings(host="localhost")
+Settings(port=8000)
+Settings(host="localhost", port=8000)
+Settings(host=None)  # error: [invalid-argument-type]
 
 # `BaseSettings` defines a specialized constructor and forbids extra values by default.
 Settings(host="localhost", port=8000, something_else=7)  # error: [unknown-argument]
@@ -823,7 +908,7 @@ Unlike fields on ordinary Pydantic models, a root model's `root` field can be pa
 positionally or by keyword:
 
 ```py
-from pydantic import RootModel
+from pydantic import RootModel, BaseModel
 
 class IntList(RootModel[list[int]]): ...
 
@@ -831,6 +916,22 @@ reveal_type(IntList.__init__)  # revealed: (self: IntList, root: Iterable[LaxInt
 
 IntList([1, 2, 3])
 IntList(root=[1, 2, 3])
+IntList(["1", "2", "3"])
+
+IntList(1)  # error: [invalid-argument-type]
+```
+
+When a root model field is included in a normal model, it can be set using the `root` type directly:
+
+```py
+class Model(BaseModel):
+    int_list: IntList
+
+Model(int_list=IntList([1, 2, 3]))
+Model(int_list=[1, 2, 3])
+Model(int_list=["1", "2", "3"])
+
+Model(int_list=1)  # error: [invalid-argument-type]
 ```
 
 ## Model configuration
@@ -929,8 +1030,33 @@ class PlainDictConfig(BaseModel):
 
     name: str
 
-# TODO: this should be an error
-PlainDictConfig(name="Alice", something_else=7)
+PlainDictConfig(name="Alice", something_else=7)  # error: [unknown-argument]
+
+class DictCallConfig(BaseModel):
+    model_config = dict(extra="forbid")
+
+    name: str
+
+DictCallConfig(name="Alice", something_else=7)  # error: [unknown-argument]
+```
+
+## Mixins
+
+Annotated attributes on mixin-classes that do not inherit from `BaseModel` also become fields on the
+model:
+
+```py
+from pydantic import BaseModel
+
+class Mixin:
+    mixin_field: bool
+
+class MyModel(BaseModel, Mixin):
+    model_field: bool
+
+# revealed: (self: MyModel, *, mixin_field: LaxBool, model_field: LaxBool, **extra: Any) -> None
+reveal_type(MyModel.__init__)
+MyModel(model_field=True, mixin_field=False)
 ```
 
 ## Differences from dataclasses
