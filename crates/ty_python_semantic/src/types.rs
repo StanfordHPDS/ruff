@@ -290,9 +290,7 @@ fn definition_expression_annotation<'db>(
     }
 }
 
-struct ApplyDefaultTypeMapping;
-struct ApplyTopMaterialization;
-struct ApplyBottomMaterialization;
+struct ApplyTypeMappingTag;
 struct ApplyMaterializationEquivalence;
 
 type MaterializationEquivalenceVisitor<'db> =
@@ -300,13 +298,18 @@ type MaterializationEquivalenceVisitor<'db> =
 
 /// A [`TypeTransformer`] that is used in `apply_type_mapping` methods.
 ///
-/// Materialization is the only mapping mode that needs to visit the same type under two different
-/// mappings within a single recursive call chain (`Top` and `Bottom`). Keep separate cycle caches
-/// for those modes so invariant checks can safely reuse one visitor.
+/// Some recursive transformations visit the same type under more than one mapping mode within a
+/// single call chain. Keep separate cycle caches for those modes so one transformation cannot
+/// reuse the result of another.
+#[derive(Default)]
 pub(crate) struct ApplyTypeMappingVisitor<'db> {
-    default: OnceCell<TypeTransformer<'db, ApplyDefaultTypeMapping>>,
-    top_materialization: OnceCell<TypeTransformer<'db, ApplyTopMaterialization>>,
-    bottom_materialization: OnceCell<TypeTransformer<'db, ApplyBottomMaterialization>>,
+    default: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
+    top_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
+    bottom_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
+    top_specialization_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
+    bottom_specialization_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
+    promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
+    skip_promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     materialization_equivalence: OnceCell<MaterializationEquivalenceVisitor<'db>>,
 }
 
@@ -323,20 +326,24 @@ impl<'db> ApplyTypeMappingVisitor<'db> {
         type_mapping: &TypeMapping<'_, 'db>,
         func: impl FnOnce() -> Type<'db>,
     ) -> Type<'db> {
-        match type_mapping {
-            TypeMapping::Materialize(MaterializationKind::Top) => self
-                .top_materialization
-                .get_or_init(TypeTransformer::default)
-                .visit_type(db, ty, func),
-            TypeMapping::Materialize(MaterializationKind::Bottom) => self
-                .bottom_materialization
-                .get_or_init(TypeTransformer::default)
-                .visit_type(db, ty, func),
-            _ => self
-                .default
-                .get_or_init(TypeTransformer::default)
-                .visit_type(db, ty, func),
-        }
+        let type_transformer = match type_mapping {
+            TypeMapping::Materialize(MaterializationKind::Top) => &self.top_materialization,
+            TypeMapping::Materialize(MaterializationKind::Bottom) => &self.bottom_materialization,
+            TypeMapping::ApplySpecializationWithMaterialization {
+                materialization_kind: MaterializationKind::Top,
+                ..
+            } => &self.top_specialization_materialization,
+            TypeMapping::ApplySpecializationWithMaterialization {
+                materialization_kind: MaterializationKind::Bottom,
+                ..
+            } => &self.bottom_specialization_materialization,
+            TypeMapping::Promote(PromotionMode::On, _) => &self.promotion,
+            TypeMapping::Promote(PromotionMode::Off, _) => &self.skip_promotion,
+            _ => &self.default,
+        };
+        type_transformer
+            .get_or_init(Box::default)
+            .visit_type(db, ty, func)
     }
 
     pub(crate) fn is_equivalent_to_materialization(
@@ -357,21 +364,8 @@ impl<'db> ApplyTypeMappingVisitor<'db> {
         debug_assert!(was_empty.is_ok());
 
         Self {
-            default: OnceCell::new(),
-            top_materialization: OnceCell::new(),
-            bottom_materialization: OnceCell::new(),
             materialization_equivalence,
-        }
-    }
-}
-
-impl Default for ApplyTypeMappingVisitor<'_> {
-    fn default() -> Self {
-        Self {
-            default: OnceCell::new(),
-            top_materialization: OnceCell::new(),
-            bottom_materialization: OnceCell::new(),
-            materialization_equivalence: OnceCell::new(),
+            ..Self::default()
         }
     }
 }
@@ -2764,29 +2758,24 @@ impl<'db> Type<'db> {
                 ..
             }) => self.instance_member(db, &name),
 
-            Type::LiteralValue(literal) if name == "__len__" => {
-                if let Some(length) = match literal.kind() {
-                    LiteralValueTypeKind::Bytes(bytes) => Some(bytes.python_len(db)),
-                    LiteralValueTypeKind::String(string) => Some(string.python_len(db)),
-                    _ => None,
-                } && let Ok(length) = i64::try_from(length)
-                {
-                    let parameters = Parameters::standard([Parameter::positional_only(Some(
-                        Name::new_static("self"),
-                    ))
-                    .with_annotated_type(self)]);
-                    Place::bound(Type::function_like_callable(
-                        db,
-                        Signature::new(parameters, Type::int_literal(length)),
-                    ))
-                    .into()
-                } else {
-                    self.to_meta_type(db)
-                        .find_name_in_mro_with_policy(db, name.as_str(), policy)
-                        .expect(
-                            "`Type::find_name_in_mro()` should return `Some()` when called on a meta-type",
-                        )
-                }
+            Type::LiteralValue(literal)
+                if name == "__len__"
+                    && let Some(length) = match literal.kind() {
+                        LiteralValueTypeKind::Bytes(bytes) => Some(bytes.python_len(db)),
+                        LiteralValueTypeKind::String(string) => Some(string.python_len(db)),
+                        _ => None,
+                    }
+                    && let Ok(length) = i64::try_from(length) =>
+            {
+                let parameters = Parameters::standard([Parameter::positional_only(Some(
+                    Name::new_static("self"),
+                ))
+                .with_annotated_type(self)]);
+                Place::bound(Type::function_like_callable(
+                    db,
+                    Signature::new(parameters, Type::int_literal(length)),
+                ))
+                .into()
             }
 
             // `type[Any]` (or `type[Unknown]`, etc.) has an unknown metaclass, but all
@@ -3936,8 +3925,10 @@ impl<'db> Type<'db> {
                 )
                 .into(),
 
-                Type::LiteralValue(literal) if literal.is_string() && name == "startswith" => {
-                    let string_literal = literal.as_string().unwrap();
+                Type::LiteralValue(literal)
+                    if name == "startswith"
+                        && let Some(string_literal) = literal.as_string() =>
+                {
                     Place::bound(Type::KnownBoundMethod(KnownBoundMethodType::StrStartswith(
                         string_literal,
                     )))
@@ -4119,9 +4110,9 @@ impl<'db> Type<'db> {
                 }
 
                 Type::LiteralValue(literal)
-                    if literal.is_bool() && matches!(name_str, "real" | "numerator") =>
+                    if matches!(name_str, "real" | "numerator")
+                        && let Some(bool_value) = literal.as_bool() =>
                 {
-                    let bool_value = literal.as_bool().unwrap();
                     Place::bound(Type::int_literal(i64::from(bool_value))).into()
                 }
 
@@ -4176,15 +4167,13 @@ impl<'db> Type<'db> {
 
                 Type::LiteralValue(literal)
                     if matches!(name_str, "name" | "_name_" | "value" | "_value_")
-                        && literal.as_enum().is_some_and(|enum_literal| {
-                            !enums::class_defines_property(
-                                db,
-                                enum_literal.enum_class(db),
-                                name_str,
-                            )
-                        }) =>
+                        && let Some(enum_literal) = literal.as_enum()
+                        && !enums::class_defines_property(
+                            db,
+                            enum_literal.enum_class(db),
+                            name_str,
+                        ) =>
                 {
-                    let enum_literal = literal.as_enum().unwrap();
                     let enum_class = enum_literal.enum_class_literal(db);
                     let is_enum_subclass = Type::ClassLiteral(enum_class.class_literal(db))
                         .is_subtype_of(db, KnownClass::Enum.to_subclass_of(db));

@@ -3434,7 +3434,6 @@ dependencies = [
  "ruff_linter",
  "ruff_python_ast",
  "ruff_ranged_value",
- "ruff_source_file",
  "ruff_workspace",
  "salsa",
 ]
@@ -3595,6 +3594,7 @@ dependencies = [
  "bstr",
  "compact_str",
  "datatest-stable",
+ "drop_bomb",
  "get-size2",
  "insta",
  "itertools 0.15.0",
