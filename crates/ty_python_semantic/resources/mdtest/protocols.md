@@ -2236,6 +2236,66 @@ int_value: JustInt = 1
 bool_value: JustInt = True  # error: [invalid-assignment]
 ```
 
+Explicitly specializing a protocol that directly declares a `__class__` write type of `type[T]` for
+one of its type parameters does not apply the `int`/`float` special case to its type arguments. This
+allows such protocols to distinguish an actual `float` from an `int`. This is a narrowly-focused
+special case to better support the `Just` type in pandas-stubs:
+
+```py
+from typing import Generic, TypeVar
+from typing_extensions import Self
+
+JustT = TypeVar("JustT")
+JustT_co = TypeVar("JustT_co", covariant=True)
+
+class Just(Protocol, Generic[JustT]):
+    @property
+    def __class__(self, /) -> type[JustT]: ...
+    @__class__.setter
+    def __class__(self, value: type[JustT], /) -> None: ...
+
+def takes_just_int(value: Just[int]) -> None: ...
+def takes_just_float(value: Just[float]) -> None: ...
+def takes_just_union(value: Just[int | float]) -> None: ...
+
+takes_just_int(1)
+takes_just_int(True)  # error: [invalid-argument-type]
+takes_just_int(1.0)  # error: [invalid-argument-type]
+
+takes_just_float(1.0)
+takes_just_float(1)  # error: [invalid-argument-type]
+takes_just_float(True)  # error: [invalid-argument-type]
+
+# An explicit union remains a union; disabling the special case must not erase its `int` member.
+takes_just_union(1)  # error: [invalid-argument-type]
+takes_just_union(1.0)  # error: [invalid-argument-type]
+
+class Timestamp:
+    def __mul__(self, other: Just[float], /) -> Self:
+        return self
+
+reveal_type(Timestamp() * 1.0)  # revealed: Timestamp
+
+class ReadClass(Protocol[JustT_co]):
+    @property
+    def __class__(self, /) -> type[JustT_co]: ...
+
+def takes_read_class(value: ReadClass[float]) -> None:
+    reveal_type(value)  # revealed: ReadClass[int | float]
+
+takes_read_class(1)
+takes_read_class(1.0)
+
+class WritableValue(Protocol[JustT]):
+    @property
+    def value(self) -> type[JustT]: ...
+    @value.setter
+    def value(self, value: type[JustT], /) -> None: ...
+
+def takes_writable_value(value: WritableValue[float]) -> None:
+    reveal_type(value)  # revealed: WritableValue[int | float]
+```
+
 A read/write property on a protocol, where the setter accepts a subtype of the type returned by the
 getter, can be satisfied by a mutable attribute of any type bounded by the upper bound of the
 getter-returned type and the lower bound of the setter-accepted type.
@@ -5294,6 +5354,61 @@ class Bar(Protocol):
 static_assert(is_equivalent_to(Foo, Bar))
 ```
 
+### Recursively-specialized generic protocols
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from __future__ import annotations
+
+from typing import Protocol
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
+
+class LeftProtocol[T](Protocol):
+    child: LeftAlias[list[T]]
+
+class RightProtocol[T](Protocol):
+    child: RightAlias[list[T]]
+
+class DifferentProtocol[T](Protocol):
+    child: DifferentProtocol[set[T]]
+
+type LeftAlias[T] = LeftProtocol[T]
+type RightAlias[T] = RightProtocol[T]
+
+# TODO: These structurally equivalent protocols should be recognized as subtypes.
+static_assert(not is_subtype_of(LeftProtocol[int], RightProtocol[int]))
+static_assert(not is_subtype_of(LeftAlias[int], RightAlias[int]))
+# A conservative cycle fallback must not accept structurally different recursive protocols.
+static_assert(not is_subtype_of(LeftProtocol[int], DifferentProtocol[int]))
+
+class FiniteLeft[T](Protocol):
+    value: T
+
+class FiniteRight[T](Protocol):
+    value: T
+
+# Reusing a non-recursive protocol at a finite nesting depth is not a recursive definition.
+static_assert(is_subtype_of(FiniteLeft[FiniteLeft[int]], FiniteRight[FiniteRight[int]]))
+static_assert(not is_subtype_of(FiniteLeft[FiniteLeft[int]], FiniteRight[FiniteRight[str]]))
+
+class ProtocolBox[T](Protocol):
+    value: T
+
+class NestedLeftProtocol[T](Protocol):
+    child: ProtocolBox[ProtocolBox[NestedLeftProtocol[list[T]]]]
+
+class NestedRightProtocol[T](Protocol):
+    child: ProtocolBox[ProtocolBox[NestedRightProtocol[list[T]]]]
+
+# TODO: These structurally equivalent protocols should be recognized as subtypes.
+static_assert(not is_subtype_of(NestedLeftProtocol[int], NestedRightProtocol[int]))
+```
+
 ### Disjointness of recursive protocol and recursive final type
 
 ```py
@@ -5652,6 +5767,35 @@ def f(c: C[int]) -> None:
     # The cycle detection assumes compatibility when it detects potential
     # infinite recursion between protocol specializations.
     takes_c(c)
+
+class Left[T](Protocol):
+    @property
+    def value(self) -> T: ...
+    @property
+    def child(self) -> "Left[list[T]]": ...
+
+class Right1[T](Protocol):
+    @property
+    def value(self) -> T: ...
+    @property
+    def child(self) -> "RightAlias1[list[T]]": ...
+
+class Right2[T](Protocol):
+    @property
+    def value(self) -> T: ...
+    @property
+    def child(self) -> "RightAlias2[set[T]]": ...
+
+type RightAlias1[T] = Right1[T]
+type RightAlias2[T] = Right2[T]
+
+def expect_right1(value: RightAlias1[int]) -> None: ...
+def expect_right2(value: RightAlias2[int]) -> None: ...
+def check(value: Left[int]) -> None:
+    # TODO: no error
+    expect_right1(value)  # error: [invalid-argument-type]
+    # This should be an error
+    expect_right2(value)  # error: [invalid-argument-type]
 ```
 
 ### Recursive legacy generic protocol
