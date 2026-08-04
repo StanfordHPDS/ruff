@@ -1,5 +1,5 @@
 use crate::{
-    Db, Program, PythonVersionSource, PythonVersionWithSource, lint::lint_documentation_url,
+    Db, PythonVersionSource, PythonVersionWithSource, lint::lint_documentation_url,
     types::TypeCheckDiagnostics,
 };
 use levenshtein::{HideUnderscoredSuggestions, find_best_suggestion};
@@ -46,11 +46,11 @@ pub fn inferred_python_version_source_annotation(
 /// configuration files, or defaults.
 pub(crate) fn add_inferred_python_version_hint_to_diagnostic(
     db: &dyn Db,
+    file: File,
     diagnostic: &mut Diagnostic,
     action: &str,
 ) {
-    let program = Program::get(db);
-    let PythonVersionWithSource { version, source } = program.python_version_with_source(db);
+    let PythonVersionWithSource { version, source } = db.python_version_with_source(file);
 
     match source {
         crate::PythonVersionSource::Cli => {
