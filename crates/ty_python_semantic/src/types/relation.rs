@@ -258,6 +258,9 @@ impl<'db> Type<'db> {
                 KnownBoundMethodType::FunctionTypeDunderGet(_)
                 | KnownBoundMethodType::FunctionTypeDunderCall(_)
                 | KnownBoundMethodType::StrStartswith(_)
+                | KnownBoundMethodType::ConstraintSetLowerBound
+                | KnownBoundMethodType::ConstraintSetUpperBound
+                | KnownBoundMethodType::ConstraintSetEquality
                 | KnownBoundMethodType::ConstraintSetRange
                 | KnownBoundMethodType::ConstraintSetAlways
                 | KnownBoundMethodType::ConstraintSetNever
@@ -2804,6 +2807,14 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                             .or(db, self.constraints, || {
                                 self.protocol_member_write_is_definitely_missing_from_ty(
                                     db, &member, other,
+                                )
+                            })
+                            .or(db, self.constraints, || {
+                                ConstraintSet::from_bool(
+                                    self.constraints,
+                                    member.has_incompatible_class_variable_declaration(
+                                        db, env, other,
+                                    ),
                                 )
                             })
                     })
