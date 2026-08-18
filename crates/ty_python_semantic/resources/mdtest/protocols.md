@@ -4044,6 +4044,88 @@ class Incompatible(SupportsMethod[T_co]):
         raise NotImplementedError
 ```
 
+## Recursive protocol receiver binding with an overloaded class method
+
+Accessing an overloaded class method on a generic protocol can recursively bind the protocol's
+receiver. The receiver-binding query must converge and preserve both overload signatures.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Protocol, overload
+
+class Container[T](Protocol):
+    def value(self) -> T: ...
+    @overload
+    @classmethod
+    def from_value[Self, S](cls: type[Self], value: S) -> object: ...
+    @overload
+    @classmethod
+    def from_value[Self, S](cls: type[Self], value: S, flag: bool) -> object: ...
+
+reveal_type(Container.from_value)  # revealed: Overload[[S](value: S) -> object, [S](value: S, flag: bool) -> object]
+```
+
+## Recursive protocol receiver binding with a bounded type variable
+
+A class method can recursively bind a protocol receiver through a type variable with a declared
+upper bound. Its declared bound is metadata, not another part of the receiver constraint.
+
+```toml
+[environment]
+python-version = "3.11"
+```
+
+```py
+from typing import Protocol, TypeVar
+
+T = TypeVar("T")
+S = TypeVar("S", bound=object)
+
+class Box(Protocol[T]):
+    value: T
+
+    @classmethod
+    def first(cls: type[S]) -> S:
+        return cls()
+
+    def second(self) -> S: ...
+    @classmethod
+    def last(cls: type[S]) -> object: ...
+
+reveal_type(Box.first())  # revealed: Box[Unknown]
+```
+
+## Recursive protocol receiver binding with a defaulted type variable
+
+A method type variable with a declared default can also appear while recursively binding a protocol
+receiver. Its default is declaration metadata, not a type-variable occurrence in the constraint.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Protocol
+
+class Box[T](Protocol):
+    value: T
+
+    @classmethod
+    def first[S = int](cls: type[S]) -> S:
+        return cls()
+
+    def second[S = int](self) -> S: ...
+    @classmethod
+    def last[S = int](cls: type[S]) -> object: ...
+
+reveal_type(Box.first())  # revealed: Box[Unknown]
+```
+
 ## Subtyping of protocols with generic method members
 
 Protocol method members can be generic. They can have generic contexts scoped to the class:
@@ -4603,6 +4685,44 @@ class NonBooleanMembership(metaclass=NonBooleanMembershipMeta):
 
 static_assert(not is_assignable_to(TypeOf[StringMembership], Container[int]))
 static_assert(not is_assignable_to(TypeOf[NonBooleanMembership], Container[int]))
+```
+
+## Class objects with bounded type-variable receivers
+
+An iterable class combined with an empty fallback must contribute its member type to generic call
+inference. A classmethod can therefore collect its own instances without losing `Self`.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Iterator
+from typing import Self
+
+class IterableMeta(type):
+    def __iter__[T](self: type[T]) -> Iterator[T]:
+        raise NotImplementedError
+
+class Item(metaclass=IterableMeta):
+    @classmethod
+    def all(cls, enabled: bool) -> frozenset[Self]:
+        items = frozenset(cls if enabled else ())
+        reveal_type(items)  # revealed: frozenset[Self@all]
+        return items
+```
+
+## Generic inference from gradual class objects
+
+`type[Any]` can be assigned to an iterable protocol. A concrete fallback must still contribute its
+element type to generic inference.
+
+```py
+from typing import Any
+
+def collect(cls: type[Any], enabled: bool) -> None:
+    reveal_type(list(cls if enabled else (1,)))  # revealed: list[int]
 ```
 
 ## Subtyping of protocols with `@classmethod` or `@staticmethod` members
