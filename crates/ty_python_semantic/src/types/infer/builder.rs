@@ -3013,6 +3013,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             | Type::SubclassOf(..)
             | Type::KnownInstance(..)
             | Type::PropertyInstance(..)
+            | Type::SlotDescriptor(..)
             | Type::FunctionLiteral(..)
             | Type::Callable(..)
             | Type::BoundMethod(_)
@@ -5411,6 +5412,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 | Type::SpecialForm(_)
                 | Type::KnownInstance(_)
                 | Type::PropertyInstance(_)
+                | Type::SlotDescriptor(_)
                 | Type::AlwaysTruthy
                 | Type::AlwaysFalsy
                 | Type::LiteralValue(_)
@@ -8632,6 +8634,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         argument_type: Type<'db>,
         argument: &'ast ast::ArgOrKeyword,
     ) -> Option<Type<'db>> {
+        // Parsed string annotations are not indexed, so their keyword arguments have no
+        // use-definition information from which to narrow dictionary keys.
+        if self.in_string_annotation() {
+            return None;
+        }
+
         let env = self.program_environment();
         let db = self.db();
         let file_scope_id = self.scope().file_scope_id(db);
@@ -10951,6 +10959,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 | Type::SpecialForm(_)
                 | Type::KnownInstance(_)
                 | Type::PropertyInstance(_)
+                | Type::SlotDescriptor(_)
                 | Type::Union(_)
                 | Type::Intersection(_)
                 | Type::EnumComplement(_)
@@ -12443,11 +12452,14 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
             let value_ty = builder.try_expression_type(value).unwrap_or_else(|| {
                 builder.infer_maybe_standalone_expression(value, TypeContext::default())
             });
-            // If the member is a data descriptor, the RHS value may differ from the value actually assigned.
+            // Arbitrary data descriptors can transform the assigned value, but slot descriptors
+            // write it directly into instance storage.
             if assignment_attribute_members(db, env, value_ty, &attr.id)
                 .and_then(AssignmentAttributeMembers::type_member)
                 .and_then(|member| member.place.ignore_possibly_undefined())
-                .is_some_and(|ty| ty.may_be_data_descriptor(db, env))
+                .is_some_and(|ty| {
+                    ty.may_be_data_descriptor(db, env) && !matches!(ty, Type::SlotDescriptor(_))
+                })
             {
                 builder.discard_dict_key_assignments_for(self.binding);
                 bound_ty = declared_ty;

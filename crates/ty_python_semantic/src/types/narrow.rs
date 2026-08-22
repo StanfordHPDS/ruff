@@ -695,6 +695,7 @@ impl ClassInfoConstraintFunction {
             | Type::FunctionLiteral(_)
             | Type::ProtocolInstance(_)
             | Type::PropertyInstance(_)
+            | Type::SlotDescriptor(_)
             | Type::KnownInstance(_)
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
@@ -879,12 +880,9 @@ fn specialize_narrowing_target_from_intersection<'db>(
         combined_constraints.intersect(db, &constraints, base_constraint);
     }
 
-    let solutions = combined_constraints.solutions(
-        db,
-        env,
-        &constraints,
-        generic_context.inferable_typevars(db),
-    );
+    let solutions = combined_constraints
+        .solutions(db, env, generic_context.inferable_typevars(db))
+        .ok()?;
     let specialized_class =
         specialize_generic_class_from_solutions(db, env, target_class, solutions)?;
     Some(Type::instance(db, env, specialized_class))
@@ -5057,6 +5055,7 @@ fn is_or_contains_typeddict<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
         | Type::SpecialForm(_)
         | Type::KnownInstance(_)
         | Type::PropertyInstance(_)
+        | Type::SlotDescriptor(_)
         | Type::AlwaysTruthy
         | Type::AlwaysFalsy
         | Type::LiteralValue(_)
@@ -5235,6 +5234,7 @@ fn all_matching_typeddict_fields_have_literal_types<'db>(
         | Type::SpecialForm(_)
         | Type::KnownInstance(_)
         | Type::PropertyInstance(_)
+        | Type::SlotDescriptor(_)
         | Type::AlwaysTruthy
         | Type::AlwaysFalsy
         | Type::LiteralValue(_)
