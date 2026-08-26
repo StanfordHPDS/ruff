@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
 
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ruff_text_size::{Ranged, TextRange};
@@ -3613,11 +3613,12 @@ impl<'db> CallableBinding<'db> {
         })
     }
 
-    /// Returns the source overload indexes that should be shown in diagnostics.
+    /// Returns the distinct source overload indexes that should be shown in diagnostics.
     ///
-    /// Bound method overloads preserve their source indexes after receiver filtering. Method
-    /// wrapper overloads are synthesized from `__get__`, so their indexes do not correspond to
-    /// the overload declarations of the underlying function.
+    /// Bound method overloads preserve their source indexes after receiver filtering. Receiver
+    /// specialization can expand one source overload into multiple signatures. Method wrapper
+    /// overloads are synthesized from `__get__`, so their indexes do not correspond to the overload
+    /// declarations of the underlying function.
     fn diagnostic_overload_indexes(
         &self,
         db: &'db dyn Db,
@@ -3632,6 +3633,7 @@ impl<'db> CallableBinding<'db> {
         self.overloads
             .iter()
             .map(Binding::source_overload_index)
+            .unique()
             .collect()
     }
 
@@ -4626,16 +4628,31 @@ impl<'db> CallableBinding<'db> {
                         function.name(context.db())
                     ));
 
-                    for overload in possible_overloads.iter().take(MAXIMUM_OVERLOADS) {
-                        diag.info(format_args!(
-                            "  {}",
-                            overload.signature(db).display(db, env)
-                        ));
+                    let possible_signatures = if possible_overloads.is_empty() {
+                        // Receiver specialization can introduce overloads through a `ParamSpec`
+                        // even when the method has no overload declarations of its own.
+                        Either::Left(self.overloads.iter().map(|overload| {
+                            if self.bound_type.is_some() {
+                                overload.signature.bind_self(db, env, None)
+                            } else {
+                                overload.signature.clone()
+                            }
+                        }))
+                    } else {
+                        Either::Right(
+                            possible_overloads
+                                .iter()
+                                .map(|overload| overload.signature(db)),
+                        )
+                    };
+                    let possible_overload_count = possible_signatures.len();
+                    for signature in possible_signatures.take(MAXIMUM_OVERLOADS) {
+                        diag.info(format_args!("  {}", signature.display(db, env)));
                     }
-                    if possible_overloads.len() > MAXIMUM_OVERLOADS {
+                    if possible_overload_count > MAXIMUM_OVERLOADS {
                         diag.info(format_args!(
                             "... omitted {remaining} overloads",
-                            remaining = possible_overloads.len() - MAXIMUM_OVERLOADS
+                            remaining = possible_overload_count - MAXIMUM_OVERLOADS
                         ));
                     }
 
@@ -6038,7 +6055,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
         let mut choose = |typevar: BoundTypeVarInstance<'db>, bounds: Option<&PathBound<'db>>| {
             let bounds = bounds?;
-            let lower = bounds.lower?;
+            let lower = bounds.evidence_lower?;
 
             if let Some(&preferred_ty) = preferred_type_mappings.get(&typevar.identity(db))
                 && lower.is_assignable_to(db, self.env, preferred_ty)
@@ -6066,6 +6083,8 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     ///
     /// Comparing the complete argument tuple with the declared tuple preserves fixed elements,
     /// nested type variable tuples, and the unbounded shape of splatted arguments.
+    /// If requested, checks the preferred type context as well. A `false` result tells the caller
+    /// to retry inference using only argument constraints.
     ///
     /// ```py
     /// def collect[*Ts](*args: *Ts) -> tuple[*Ts]: ...
@@ -6077,14 +6096,15 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     fn infer_typevartuple_argument_constraints<'c>(
         &self,
         builder: &mut SpecializationBuilder<'db, 'c>,
+        check_type_context: bool,
         specialization_errors: &mut Vec<BindingError<'db>>,
-    ) -> Result<(), (SpecializationError<'db>, Option<usize>)> {
+    ) -> bool {
         let db = self.db;
         let Some((parameter_index, parameter)) = self.signature.parameters().variadic() else {
-            return Ok(());
+            return true;
         };
         if !parameter.has_starred_annotation() {
-            return Ok(());
+            return true;
         }
 
         // An untouched variadic parameter remains available to future calls of a partial. In
@@ -6096,7 +6116,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     .any(|matched| matched.index == parameter_index)
             })
         {
-            return Ok(());
+            return true;
         }
 
         let (formal, typevartuple) = match parameter.annotated_type() {
@@ -6113,27 +6133,41 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         }
                     })
                 else {
-                    return Ok(());
+                    return true;
                 };
                 (annotation, typevartuple)
             }
         };
 
         if !self.can_infer_typevartuple_arguments(parameter_index, typevartuple) {
-            return Ok(());
+            return true;
         }
 
         let Some((actual, argument_indices)) =
             self.collect_typevartuple_arguments(parameter_index, parameter, formal)
         else {
-            return Ok(());
+            return true;
         };
 
-        builder.infer(formal, actual).map_err(|error| {
-            let argument_index =
-                argument_indices.and_then(|(first, last)| (first == last).then_some(first));
-            (error, argument_index)
-        })?;
+        if let Err(error) = builder.infer(formal, actual) {
+            // Fixed elements may already have produced the same specialization error.
+            if !specialization_errors.iter().any(|existing| {
+                matches!(
+                    existing,
+                    BindingError::SpecializationError {
+                        error: existing,
+                        ..
+                    } if existing == &error
+                )
+            }) {
+                specialization_errors.push(BindingError::SpecializationError {
+                    error,
+                    argument_index: argument_indices
+                        .and_then(|(first, last)| (first == last).then_some(first)),
+                });
+            }
+            return !check_type_context;
+        }
 
         if self.signature.generic_context.is_some() {
             let specialization = builder.build_with(|_, _| None);
@@ -6157,9 +6191,18 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     parameter_source: None,
                 });
             }
+
+            // A preferred return context can fix the pack before argument inference reaches it.
+            // Check the complete arguments against that specialization, including the empty tuple
+            // from `A()`, so an incompatible `A[*Us, int]` is retried without the context.
+            return !check_type_context
+                || self.is_partial_application
+                || actual
+                    .apply_specialization(db, specialization)
+                    .is_assignable_to(db, self.env, expected_ty);
         }
 
-        Ok(())
+        true
     }
 
     /// Returns whether a type variable tuple can be inferred from its variadic arguments.
@@ -6343,25 +6386,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             }
         }
 
-        if let Err((error, argument_index)) =
-            self.infer_typevartuple_argument_constraints(builder, specialization_errors)
-            && !specialization_errors.iter().any(|existing| {
-                matches!(
-                    existing,
-                    BindingError::SpecializationError {
-                        error: existing,
-                        ..
-                    } if existing == &error
-                )
-            })
-        {
-            specialization_errors.push(BindingError::SpecializationError {
-                error,
-                argument_index,
-            });
-        }
-
-        preferred_type_mappings
+        self.infer_typevartuple_argument_constraints(
+            builder,
+            !preferred_type_mappings.is_empty(),
+            specialization_errors,
+        ) && preferred_type_mappings
             .iter()
             .all(|(&identity, &preferred_ty)| {
                 partially_specialized_declared_type.contains(&identity)
