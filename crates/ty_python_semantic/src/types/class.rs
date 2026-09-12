@@ -31,7 +31,7 @@ use crate::types::constraints::{
     ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
 };
 use crate::types::enums::enum_metadata;
-use crate::types::function::{AbstractMethodKind, DataclassTransformerParams};
+use crate::types::function::DataclassTransformerParams;
 use crate::types::generics::{GenericContext, Specialization, walk_specialization};
 use crate::types::infer::infer_definition_types;
 use crate::types::known_instance::DeprecatedInstance;
@@ -53,10 +53,7 @@ use crate::types::{
 };
 use crate::{
     Db, FxIndexMap, FxOrderSet,
-    place::{
-        Definedness, LookupError, LookupResult, Place, PlaceAndQualifiers, PublicTypePolicy,
-        place_from_bindings, place_from_declarations,
-    },
+    place::{Definedness, LookupError, LookupResult, Place, PlaceAndQualifiers, PublicTypePolicy},
     types::{MetaclassCandidate, TypeDefinition, UnionType},
 };
 use itertools::Either;
@@ -66,9 +63,10 @@ use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, NodeIndex};
 use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::FxHashSet;
+use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::ScopeId;
-use ty_python_core::{ProgramFile, place_table, use_def_map};
 
 mod dynamic_literal;
 mod enum_literal;
@@ -1436,118 +1434,51 @@ impl<'db> ClassType<'db> {
         }
     }
 
+    /// Visit this class and its explicit ancestors depth-first and left-to-right, yielding each
+    /// distinct specialization once. Cyclic classes are skipped.
+    ///
+    /// Unlike the MRO, this traversal preserves separate specializations contributed by different
+    /// inheritance paths, applying type arguments at each step:
+    ///
+    /// ```python
+    /// from typing import Any
+    ///
+    /// class Base[T]: ...
+    /// class Gradual(Base[Any]): ...
+    /// class Concrete[T](Base[T]): ...
+    /// class Child(Gradual, Concrete[int]): ...
+    /// ```
+    ///
+    /// For `Child`, this yields both `Base[Any]` and `Base[int]`, which constrain its subclasses.
+    /// Use [`Self::iter_mro`] for member lookup, where the single `Base[Any]` entry determines
+    /// which specialization to use.
+    pub(super) fn iter_explicit_ancestors(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> impl Iterator<Item = Self> {
+        let mut pending = vec![self];
+        let mut seen = FxHashSet::default();
+        std::iter::from_fn(move || {
+            loop {
+                let class = pending.pop()?;
+                if !seen.insert(class) || ClassBase::Class(class).has_cyclic_mro(db) {
+                    continue;
+                }
+                let (literal, specialization) = class.class_literal_and_specialization(db);
+                pending.extend(literal.explicit_bases(db).iter().rev().filter_map(|base| {
+                    ClassBase::try_from_explicit_base(db, env, *base, Some(literal))?
+                        .apply_optional_specialization(db, specialization)
+                        .into_class()
+                }));
+                return Some(class);
+            }
+        })
+    }
+
     /// Is this class final?
     pub(super) fn is_final(self, db: &'db dyn Db) -> bool {
         self.class_literal(db).is_final(db)
-    }
-
-    /// Returns a map of methods on this class that were defined as abstract on a superclass
-    /// and have not been overridden with a concrete implementation anywhere in the MRO
-    ///
-    /// The value of the map is a struct containing information about the abstract method.
-    #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
-    pub(in crate::types) fn abstract_methods(
-        self,
-        db: &'db dyn Db,
-    ) -> FxIndexMap<Name, AbstractMethod<'db>> {
-        fn type_as_abstract_method<'db>(
-            db: &'db dyn Db,
-            ty: Type<'db>,
-            defining_class: ClassType<'db>,
-        ) -> Option<AbstractMethodKind> {
-            match ty {
-                Type::FunctionLiteral(function) => function.as_abstract_method(db, defining_class),
-                Type::BoundMethod(method) => {
-                    type_as_abstract_method(db, method.func(db), defining_class)
-                }
-                Type::PropertyInstance(property) => {
-                    // A property is abstract if any of its accessors is abstract.
-                    property
-                        .getter(db)
-                        .and_then(|getter| type_as_abstract_method(db, getter, defining_class))
-                        .or_else(|| {
-                            property.setter(db).and_then(|setter| {
-                                type_as_abstract_method(db, setter, defining_class)
-                            })
-                        })
-                        .or_else(|| {
-                            property.deleter(db).and_then(|deleter| {
-                                type_as_abstract_method(db, deleter, defining_class)
-                            })
-                        })
-                }
-                _ => None,
-            }
-        }
-
-        let mut abstract_methods: FxIndexMap<Name, _> = FxIndexMap::default();
-        let env = &ProgramEnvironment::from_file(self.class_literal(db).program_file(db));
-
-        // Iterate through the MRO in reverse order,
-        // skipping `object` (we know it doesn't define any abstract methods)
-        for supercls in self.iter_mro(db).rev().skip(1) {
-            let ClassBase::Class(class) = supercls else {
-                continue;
-            };
-
-            // Currently we do not recognize dynamic classes as being able to define abstract methods,
-            // but we do recognise them as being able to override abstract methods defined in static classes.
-            let ClassLiteral::Static(class_literal) = class.class_literal(db) else {
-                abstract_methods
-                    .retain(|name, _| class.own_class_member(db, env, None, name).is_undefined());
-                continue;
-            };
-
-            let scope = class_literal.body_scope(db);
-            let place_table = place_table(db, scope);
-            let use_def_map = use_def_map(db, class_literal.body_scope(db));
-
-            // Treat abstract methods from superclasses as having been overridden
-            // if this class has a synthesized method by that name,
-            // or this class has a `ClassVar` declaration by that name
-            abstract_methods.retain(|name, _| {
-                if class_literal
-                    .own_synthesized_member(db, env, None, None, name)
-                    .is_some()
-                {
-                    return false;
-                }
-
-                place_table.symbol_id(name).is_none_or(|symbol_id| {
-                    let declarations = use_def_map.end_of_scope_symbol_declarations(symbol_id);
-                    !place_from_declarations(db, env, declarations)
-                        .ignore_conflicting_declarations()
-                        .qualifiers
-                        .contains(TypeQualifiers::CLASS_VAR)
-                })
-            });
-
-            for (symbol_id, bindings_iterator) in use_def_map.all_end_of_scope_symbol_bindings() {
-                let name = place_table.symbol(symbol_id).name();
-                let place_and_definition = place_from_bindings(db, env, bindings_iterator);
-                let Place::Defined(DefinedPlace { ty, .. }) = place_and_definition.place else {
-                    continue;
-                };
-                let Some(definition) = place_and_definition.first_definition else {
-                    continue;
-                };
-                if let Some(kind) = type_as_abstract_method(db, ty, class) {
-                    let abstract_method = AbstractMethod {
-                        defining_class: class,
-                        definition,
-                        kind,
-                    };
-                    abstract_methods.insert(name.clone(), abstract_method);
-                } else {
-                    // If this method is concrete, remove it from the map of abstract methods.
-                    abstract_methods.shift_remove(name);
-                }
-            }
-        }
-
-        abstract_methods.shrink_to_fit();
-
-        abstract_methods
     }
 
     /// Returns `true` if any class in this class's MRO (excluding `object`) defines an ordering
@@ -2678,7 +2609,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             _ => {}
         }
 
-        source.iter_mro(db).when_any(db, self.constraints, |base| {
+        let mut generic_target = None;
+        let result = source.iter_mro(db).when_any(db, self.constraints, |base| {
             match base {
                 ClassBase::Any => ConstraintSet::from_bool(
                     self.constraints,
@@ -2708,34 +2640,45 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     }
 
                     // Two generic classes match if they have the same origin and compatible specializations.
-                    (ClassType::Generic(source), ClassType::Generic(target)) => {
-                        ConstraintSet::from_bool(
-                            self.constraints,
-                            source.origin(db) == target.origin(db),
+                    (ClassType::Generic(source), ClassType::Generic(target))
+                        if source.origin(db) == target.origin(db) =>
+                    {
+                        generic_target = Some(target);
+                        self.check_specialization_pair(
+                            db,
+                            source.specialization(db),
+                            target.specialization(db),
                         )
-                        .and(db, self.constraints, || {
-                            self.check_specialization_pair(
-                                db,
-                                source.specialization(db),
-                                target.specialization(db),
-                            )
-                        })
                     }
 
-                    // Generic and non-generic classes don't match.
-                    (ClassType::Generic(_), ClassType::NonGeneric(_))
+                    // Different generic origins, or generic and non-generic classes, don't match.
+                    (ClassType::Generic(_), ClassType::Generic(_) | ClassType::NonGeneric(_))
                     | (ClassType::NonGeneric(_), ClassType::Generic(_)) => self.never(),
                 },
             }
+        });
+
+        let Some(target) = generic_target else {
+            return result;
+        };
+
+        // The MRO retains only one specialization per class. A different inheritance path can
+        // still establish the relation: `Child(Gradual, Concrete)` is a subtype of `Base[int]`
+        // through `Concrete`, even if `Gradual` contributes `Base[Any]` to Child's MRO.
+        result.or(db, self.constraints, || {
+            source
+                .iter_explicit_ancestors(db, self.env)
+                .filter_map(ClassType::into_generic_alias)
+                .filter(|ancestor| ancestor.origin(db) == target.origin(db))
+                .when_any(db, self.constraints, |ancestor| {
+                    self.check_specialization_pair(
+                        db,
+                        ancestor.specialization(db),
+                        target.specialization(db),
+                    )
+                })
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
-pub(super) struct AbstractMethod<'db> {
-    pub(super) defining_class: ClassType<'db>,
-    pub(super) definition: Definition<'db>,
-    pub(super) kind: AbstractMethodKind,
 }
 
 /// The decorator category for a method-like function.
