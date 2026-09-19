@@ -1,4 +1,5 @@
 use itertools::Either;
+use ruff_db::diagnostic::Annotation;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_diagnostics::{Edit, Fix};
@@ -13,14 +14,15 @@ use super::{DeferredExpressionState, TypeInferenceBuilder};
 use crate::types::call::CallArguments;
 use crate::types::definition_resolution::{ImportAliasResolution, resolve_definition};
 use crate::types::diagnostic::{
-    self, EXPERIMENTAL_SYNTAX, INVALID_TYPE_FORM, NOT_SUBSCRIPTABLE, UNBOUND_TYPE_VARIABLE,
-    UNSUPPORTED_OPERATOR, report_invalid_argument_number_to_special_form,
+    self, EXPERIMENTAL_SYNTAX, INVALID_INIT_TYPE_VARIABLE, INVALID_TYPE_FORM, NOT_SUBSCRIPTABLE,
+    UNBOUND_TYPE_VARIABLE, UNSUPPORTED_OPERATOR, report_invalid_argument_number_to_special_form,
     report_invalid_arguments_to_callable, report_invalid_concatenate_last_arg,
     report_missing_type_arguments, report_unsupported_binary_operation,
 };
 use crate::types::infer::builder::subscript::AnnotatedExprContext;
 use crate::types::infer::{
-    InferenceFlags, TypeExpressionFlags, implicit_alias_parameters, infer_implicit_alias_type,
+    ImplicitAliasInference, InferenceFlags, TypeExpressionFlags, implicit_alias_parameters,
+    infer_implicit_alias_type,
 };
 use crate::types::signatures::{ConcatenateTail, Signature};
 use crate::types::special_form::{AliasSpec, LegacyStdlibAlias};
@@ -35,14 +37,14 @@ use crate::types::{
     IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType, LintDiagnosticGuard,
     Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeContext, TypeFormType,
     TypeGuardType, TypeIsType, TypeMapping, TypeVarKind, UnionBuilder, UnionType, any_over_type,
-    todo_type,
+    binding_type, todo_type,
 };
 use crate::{FxOrderSet, SemanticModel, add_inferred_python_version_hint_to_diagnostic};
 
 /// Type expressions
 impl<'db> TypeInferenceBuilder<'db, '_> {
     fn recursive_implicit_alias_reference(
-        &self,
+        &mut self,
         value_ty: Type<'db>,
         definition: Option<Definition<'db>>,
     ) -> Option<(Type<'db>, Option<GenericContext<'db>>)> {
@@ -107,23 +109,35 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             _ => return None,
         }
         let parameters = implicit_alias_parameters(db, definition);
-        let ty = infer_implicit_alias_type(db, definition, parameters);
-        any_over_type(db, self.program_environment(), ty, false, |ty| {
+        let ty = infer_implicit_alias_type(db, definition, parameters).ty;
+        if !any_over_type(db, self.program_environment(), ty, false, |ty| {
             matches!(ty, Type::Recursive(_))
-        })
-        .then_some((ty, parameters))
+        }) {
+            return None;
+        }
+
+        // Diagnostics and suppression usage belong to the file defining the alias.
+        if definition.program_file(db) == self.program_file()
+            && self.context.should_collect_diagnostics()
+        {
+            self.implicit_aliases.insert(definition);
+        }
+        Some((ty, parameters))
     }
 
     pub(in crate::types::infer) fn finish_implicit_alias_type(
         mut self,
         definition: Definition<'db>,
         value: &ast::Expr,
-    ) -> Type<'db> {
+    ) -> ImplicitAliasInference<'db> {
         self.typevar_binding_context = Some(definition);
         self.context.inference_flags |= InferenceFlags::IN_TYPE_ALIAS;
         let ty = self.infer_type_expression(value);
-        let _diagnostics = self.context.finish();
-        ty
+        ImplicitAliasInference {
+            ty,
+            diagnostics: self.context.finish(),
+            implicit_aliases: self.implicit_aliases.into_iter().collect(),
+        }
     }
 
     const fn type_expression_context(&self) -> &'static str {
@@ -266,9 +280,6 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             builder.deferred_state.is_deferred()
                 || builder.in_stub()
                 || builder.is_in_type_checking_block(builder.scope(), expression)
-                || builder
-                    .inference_flags()
-                    .contains(InferenceFlags::IN_PEP_613_ALIAS_FIRST_PASS)
         };
         let ignore_experimental_runtime_errors = |builder: &Self| {
             ignore_runtime_errors(builder)
@@ -1376,7 +1387,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     if self
                         .type_expression_flags(element)
                         .contains(TypeExpressionFlags::UNPACK)
-                        && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, tuple)
+                        && let Some(builder) =
+                            self.context.report_lint(&INVALID_TYPE_FORM, ellipsis)
                     {
                         let mut diagnostic =
                             builder.into_diagnostic("Invalid `tuple` specialization");
@@ -1395,7 +1407,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
                 for element in elements {
                     if element.is_ellipsis_literal_expr() {
-                        if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, tuple) {
+                        if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, element)
+                        {
                             let mut diagnostic =
                                 builder.into_diagnostic("Invalid `tuple` specialization");
                             diagnostic.set_primary_annotation_message(
@@ -1490,7 +1503,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
             single_element => {
                 if single_element.is_ellipsis_literal_expr() {
-                    if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, tuple) {
+                    if let Some(builder) =
+                        self.context.report_lint(&INVALID_TYPE_FORM, single_element)
+                    {
                         let mut diagnostic =
                             builder.into_diagnostic("Invalid `tuple` specialization");
                         diagnostic.set_primary_annotation_message(
@@ -3362,6 +3377,42 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     /// invalid scope does not also make `Callable[P, R]` or `tuple[*Ts]` appear malformed.
     fn check_type_variable_scope(&self, expression: &ast::Expr, ty: Type<'db>) -> Type<'db> {
         let db = self.db();
+        if let Type::TypeVar(typevar) = ty
+            && !typevar.typevar(db).is_self(db)
+            && self
+                .inference_flags()
+                .contains(InferenceFlags::IN_INIT_RECEIVER_ANNOTATION)
+            && let Some(owner) = typevar.binding_context(db).definition()
+            && matches!(owner.kind(db), DefinitionKind::Class(_))
+            && let Some(builder) = self
+                .context
+                .report_lint(&INVALID_INIT_TYPE_VARIABLE, expression)
+        {
+            let mut diagnostic = builder.into_diagnostic(format_args!(
+                "First parameter of `__init__` cannot use the class's type variable `{}`",
+                typevar.name(db)
+            ));
+            diagnostic.set_concise_message(format_args!(
+                "First parameter of `__init__` cannot use the class's type variable `{}`",
+                typevar.name(db)
+            ));
+            diagnostic.set_primary_annotation_message(format_args!(
+                "`{}` used in the first parameter's annotation here",
+                typevar.name(db)
+            ));
+            if let Type::ClassLiteral(class) = binding_type(db, owner) {
+                diagnostic.annotate(Annotation::secondary(class.header_span(db)).message(
+                    format_args!("`{}` is a type parameter of this class", typevar.name(db)),
+                ));
+            }
+            diagnostic.info(
+                "Using a class's type variables here can make the constructed type ambiguous",
+            );
+            diagnostic.help("Use a new type variable, or omit the first parameter's annotation");
+            diagnostic
+                .info("See https://typing.python.org/en/latest/spec/constructors.html#init-method");
+        }
+
         // Legacy aliases introduce independent type parameters. PEP 695 aliases can instead
         // capture their enclosing class's parameters.
         if let Type::TypeVar(typevar) = ty
