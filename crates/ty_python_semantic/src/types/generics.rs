@@ -1365,7 +1365,7 @@ impl<'db> Specialization<'db> {
     /// MRO of `B[int]`.
     fn apply_specialization(self, db: &'db dyn Db, other: Specialization<'db>) -> Self {
         let env = &ProgramEnvironment::from_program(other.generic_context(db).program(db));
-        self.apply_specialization_impl(db, other, &ApplyTypeMappingVisitor::new(env))
+        self.apply_specialization_impl(db, other, false, &ApplyTypeMappingVisitor::new(env))
     }
 
     /// Compose specializations while preserving the enclosing transformation's recursion guard.
@@ -1373,11 +1373,15 @@ impl<'db> Specialization<'db> {
         self,
         db: &'db dyn Db,
         other: Specialization<'db>,
+        specialize_self_domain: bool,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Self {
         let specialized = self.apply_type_mapping_impl(
             db,
-            &TypeMapping::ApplySpecialization(ApplySpecialization::specialization(other)),
+            &TypeMapping::ApplySpecialization(ApplySpecialization::Specialization {
+                specialization: other,
+                specialize_self_domain,
+            }),
             &[],
             visitor,
         );
@@ -2824,7 +2828,6 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                                     db,
                                     builder.env,
                                     builder.constraints,
-                                    builder.inferable,
                                     path_bound,
                                 )
                             });
@@ -2978,7 +2981,6 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                             db,
                             builder.env,
                             builder.constraints,
-                            builder.inferable,
                             path_bound,
                         )
                     })
@@ -3386,7 +3388,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     .map(|accumulator| accumulator.get_or_build(db, self.env));
                 let chosen = match mapped_ty {
                     Some(mapped_ty) => {
-                        let candidate = CandidateTypeVarSolution::exact(*variable, mapped_ty);
+                        // The legacy map has already merged its solutions and discarded their
+                        // directional bounds. Treat the resulting mapping as an exact equality.
+                        let candidate =
+                            CandidateTypeVarSolution::from_equivalence(*variable, mapped_ty);
                         choose(*variable, Some(&candidate)).unwrap_or(mapped_ty)
                     }
                     None => choose(*variable, None)?,
@@ -3553,13 +3558,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             self.inferable,
             SolutionBudget::default(),
             |_variance, path_bound| {
-                CandidateSolutions::preliminary_solve(
-                    db,
-                    self.env,
-                    self.constraints,
-                    self.inferable,
-                    path_bound,
-                )
+                CandidateSolutions::preliminary_solve(db, self.env, self.constraints, path_bound)
             },
         );
 
