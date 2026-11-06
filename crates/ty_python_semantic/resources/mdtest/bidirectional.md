@@ -950,6 +950,18 @@ def empty_with_default[T = bool]() -> T:
 reveal_type(bounded(empty_with_default()))  # revealed: bool
 ```
 
+Constraints inferred against validity bounds are treated as inference evidence during fixpoint
+iteration:
+
+```py
+def index_of[T](items: list[T], item: T) -> int:
+    return items.index(item)
+
+def _(rows: list[list[int]]):
+    index_of(rows, reveal_type(list()))  # revealed: list[int]
+    bounded(index_of(rows, reveal_type(list())))  # revealed: list[int]
+```
+
 ## Upper-bound context with constrained type variables
 
 The solution to a constrained type variable is chosen to satisfy outer validity constraints:
@@ -1957,6 +1969,67 @@ x2: list[A] | list[dict[str, int]] = lst(reveal_type({"value": 1}))  # revealed:
 reveal_type(x2)  # revealed: list[A] | list[dict[str, int]]
 ```
 
+If inferring a generic call against a member of the declared type produces a wider return type, that
+member is excluded from the result.
+
+```py
+def make_list[U = str]() -> list[U] | list[int]:
+    raise NotImplementedError
+
+def _():
+    x1 = make_list()
+    reveal_type(x1)  # revealed: list[str] | list[int]
+
+    # TODO: Ideally this would return the same result as the unannotated case, but it's
+    # not clear which result is more desirable.
+    x2: list[str] | list[int] = make_list()
+    reveal_type(x2)  # revealed: list[int]
+```
+
+If multiple alternatives are inferred for a given type variable during fixpoint iteration, however,
+they are not later narrowed unnecessarily:
+
+```py
+def choose[T](x: T, y: T) -> T:
+    return x
+
+def _(ints: list[int]):
+    x1 = choose(make_list(), ints)
+    reveal_type(x1)  # revealed: list[str] | list[int]
+
+    x2 = choose(choose(make_list(), ints), ints)
+    reveal_type(x2)  # revealed: list[str] | list[int]
+```
+
+Dynamic types inferred from arguments are also preserved.
+
+```py
+def _(values: list[Any]):
+    x = choose(head_or(list(values), default=None), None)
+    reveal_type(x)  # revealed: Any | None
+```
+
+A nested generic call still participates in narrowing if inferred against an explicit declared type.
+
+```py
+def wrap[T, U](a: list[T], b: U) -> tuple[T]:
+    return (a[0],)
+
+x1: tuple[list[str] | list[int]] = wrap(
+    [reveal_type(make_list())],  # revealed: list[int]
+    reveal_type(make_list()),  # revealed: list[str] | list[int]
+)
+
+def wrap_tuple[T, U](pair: tuple[T, U]) -> tuple[T]:
+    return (pair[0],)
+
+x2: tuple[list[str] | list[int]] = wrap_tuple((
+    reveal_type(make_list()),  # revealed: list[int]
+    # TODO: This should remain `list[str] | list[int]`.
+    reveal_type(make_list()),  # revealed: list[int]
+))
+```
+
 ## Literal union context for generic calls
 
 Narrowing a small literal union preserves the precise result of a nested generic call, including
@@ -2245,6 +2318,19 @@ def f9(func: Callable[[], Union[Awaitable[T2], T2]]) -> Future[T2]:
     return future
 ```
 
+Variadic arguments are inferred using their matching parameter as type context.
+
+```py
+@overload
+def pair[T: int, U](*args: *tuple[list[T], list[U]]) -> tuple[T, U]: ...
+@overload
+def pair(first: list[str], second: list[int], /) -> tuple[str, int]: ...
+def pair(*args: object) -> object:
+    raise NotImplementedError
+
+reveal_type(pair([42], ["x"]))  # revealed: tuple[int, str]
+```
+
 ## Class constructor parameters
 
 The parameters of both `__init__` and `__new__` are used as type context sources for constructor
@@ -2303,7 +2389,7 @@ def from_or(values: list[str] | None) -> None:
 
 def constructor_fallback(values: list[int] | None) -> None:
     # TODO: This should reveal `list[int]` based on the peer type context.
-    reveal_type(values or list())  # revealed: list[int] | list[Unknown]
+    reveal_type(values or list())  # revealed: (list[int] & ~AlwaysFalsy) | list[Unknown]
 
 def from_and(values: list[str]) -> None:
     reveal_type(values and [])  # revealed: list[str]
@@ -2659,6 +2745,30 @@ def _(a: A, b: list[A]):
     reveal_type(x6)  # revealed: A
 ```
 
+A call argument contributes constraints to its siblings even if they form an arbitrary subset of its
+inferred type.
+
+```py
+def copy[T](items: list[T]) -> list[T]:
+    return items.copy()
+
+def copy_or_none[T](items: list[T]) -> list[T] | None:
+    raise NotImplementedError
+
+def _(
+    rows: list[list[int] | list[str]],
+    optional_rows: list[list[int] | list[str] | None],
+) -> None:
+    pair_with_list(reveal_type(copy([1])), rows)  # revealed: list[int]
+    pair_with_list(reveal_type(copy_or_none([1])), optional_rows)  # revealed: list[int] | None
+
+def pack[T](items: list[T]) -> tuple[list[T]]:
+    return (items,)
+
+def _(rows: list[tuple[list[int] | list[str]] | None]) -> None:
+    pair_with_list(pack([1]), rows)
+```
+
 ```py
 from typing import TypedDict, reveal_type
 
@@ -2669,11 +2779,12 @@ def f[T](x: T, y: T) -> T:
     return x
 
 def _(td: TD):
-    # revealed: TD
-    x = reveal_type(f(td, reveal_type({"x": 1})))  # revealed: TD
-
     # TODO: The initial type of the dictionary literal pollutes later
     # iterations, meaning we fail to narrow to `TD` here.
+    # revealed: TD | dict[str, int]
+    x = reveal_type(f(td, reveal_type({"x": 1})))  # revealed: TD | dict[str, int]
+
+    # TODO: This should also be `TD`.
     x = f(td, reveal_type({"x": 1}))  # revealed: TD | dict[str, int]
     reveal_type(x)  # revealed: TD | dict[str, int]
 ```
