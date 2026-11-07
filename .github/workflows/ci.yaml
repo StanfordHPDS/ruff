@@ -1514,22 +1514,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The r benchmarks dominate runtime, so group them with a-c to balance both modes.
+          # Group the micro benchmarks by initial letter to balance wall time in both modes.
           - name: micro-1
             target: ty
-            filter: 'ty_micro\[[a-cr]'
+            filter: 'ty_micro\[[m-r]'
             mode: simulation
           - name: micro-2
             target: ty
-            filter: 'ty_micro\[[^a-cr]'
+            filter: 'ty_micro\[[^m-r]'
             mode: simulation
           - name: micro-1
             target: ty
-            filter: 'ty_micro\[[a-cr]'
+            filter: 'ty_micro\[[m-r]'
             mode: memory
           - name: micro-2
             target: ty
-            filter: 'ty_micro\[[^a-cr]'
+            filter: 'ty_micro\[[^m-r]'
             mode: memory
           - name: constraint_set
             target: ty_constraint_set
@@ -1585,6 +1585,7 @@ jobs:
         uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5 # v5.4.0
         with:
           mode: ${{ matrix.mode }}
+          disable-memory-capture-stack: true
           run: uv run --only-dev cargo codspeed run --bench "${{ matrix.target }}" "${{ matrix.filter }}"
 
   benchmarks-walltime-ruff-build:

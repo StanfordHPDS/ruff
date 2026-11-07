@@ -1974,11 +1974,11 @@ def narrow_typed_dict_to_dict(value: int | Payload) -> None:
         value["optional"] = "present"
         reveal_type(value.pop("optional"))  # revealed: str
 
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.clear()
         # error: [invalid-argument-type] "Cannot pop required field 'key' from TypedDict `Payload`"
         value.pop("key")
-        # error: [invalid-key] "Unknown key "unexpected" for TypedDict `Payload`"
+        # error: [invalid-typed-dict-key] "Unknown key "unexpected" for TypedDict `Payload`"
         value["unexpected"] = 1
         # error: [invalid-argument-type] "Cannot delete required key "key" from TypedDict `Payload`"
         del value["key"]
@@ -1990,7 +1990,7 @@ Same for `MutableMapping`:
 def narrow_typed_dict_to_mutable_mapping(value: Payload) -> None:
     if isinstance(value, MutableMapping):
         reveal_type(value)  # revealed: Payload
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.clear()
 ```
 
@@ -2000,7 +2000,7 @@ And for `Mapping`:
 def narrow_typed_dict_to_mapping(value: Payload) -> None:
     if isinstance(value, Mapping):
         reveal_type(value)  # revealed: Payload
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.clear()
 ```
 
@@ -2012,7 +2012,7 @@ PayloadAlias = Payload
 def narrow_aliased_typed_dict_to_dict(value: PayloadAlias) -> None:
     if isinstance(value, dict):
         reveal_type(value)  # revealed: Payload
-        # error: [unresolved-attribute]
+        # error: [missing-attribute]
         value.clear()
 ```
 
@@ -2021,8 +2021,7 @@ def narrow_aliased_typed_dict_to_dict(value: PayloadAlias) -> None:
 After narrowing `Iterable[T] | T` to a non-sized iterable, `T` might itself be an iterable whose
 items have a different type. Permissive narrowing represents that possibility with `Unknown`, so the
 constructor infers `list[T | Unknown]`. Its acceptance as `Collection[T] | T` is unsound; it does
-not establish that all elements have type `T`. The same inferred type appears with and without a
-return context.
+not establish that all elements have type `T`.
 
 ```toml
 [environment]
@@ -2039,7 +2038,7 @@ def maybe_iterable_to_list[T](value: Iterable[T] | T) -> Collection[T] | T:
     if isinstance(value, Iterable) and not isinstance(value, Sized):
         # revealed: list[T@maybe_iterable_to_list | Unknown]
         reveal_type(list(value))
-        # revealed: list[T@maybe_iterable_to_list | Unknown]
+        # revealed: list[T@maybe_iterable_to_list]
         return reveal_type(list(value))
     raise NotImplementedError
 ```

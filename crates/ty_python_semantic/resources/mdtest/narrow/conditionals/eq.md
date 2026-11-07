@@ -871,7 +871,7 @@ The comparison narrows a `str | int` to the matching builtin type. A plain strin
 def compare_with_enum_member(value: str | int):
     if value == String.X:
         reveal_type(value)  # revealed: str
-        value.name  # error: [unresolved-attribute]
+        value.name  # error: [missing-attribute]
 
     if Integer.X == value:
         reveal_type(value)  # revealed: int
@@ -1794,7 +1794,7 @@ from ty_extensions import Intersection, Not
 def without_literal_origin(value: Intersection[str, Not[LiteralString]]) -> None:
     if value == "hello":
         reveal_type(value)  # revealed: str & ~LiteralString
-        value.definitely_missing_attribute  # error: [unresolved-attribute]
+        value.definitely_missing_attribute  # error: [missing-attribute]
 
     if "hello" == value:
         reveal_type(value)  # revealed: str & ~LiteralString
@@ -1868,6 +1868,50 @@ def _(x: Literal[1, 2], y: Literal[2, 3]):
         reveal_type(x)  # revealed: Literal[1, 2]
     else:
         reveal_type(x)  # revealed: Literal[2]
+```
+
+## Narrowing overlapping string, bytes, and integer literal unions
+
+Equality narrows each operand to the shared values. With very wide unions, applying that constraint
+can itself require comparing many pairs. In that case ty narrows to the builtin types of the shared
+values. For inequality, each value on either side can differ from some value on the other side.
+
+```py
+from typing import Literal
+
+def _(left: Literal["a", "b", "c"], right: Literal["b", "c", "d"]):
+    if left == right:
+        reveal_type(left)  # revealed: Literal["b", "c"]
+        reveal_type(right)  # revealed: Literal["b", "c"]
+    else:
+        reveal_type(left)  # revealed: Literal["a", "b", "c"]
+        reveal_type(right)  # revealed: Literal["b", "c", "d"]
+
+    if left != right:
+        reveal_type(left)  # revealed: Literal["a", "b", "c"]
+        reveal_type(right)  # revealed: Literal["b", "c", "d"]
+    else:
+        reveal_type(left)  # revealed: Literal["b", "c"]
+        reveal_type(right)  # revealed: Literal["b", "c"]
+```
+
+Equality also preserves the order of the shared literals in bytes, integer, and mixed unions.
+
+```py
+def _(left: Literal[b"a", b"b", b"c"], right: Literal[b"c", b"b", b"d"]):
+    if left == right:
+        reveal_type(left)  # revealed: Literal[b"b", b"c"]
+        reveal_type(right)  # revealed: Literal[b"c", b"b"]
+
+def _(left: Literal[1, 2, 3], right: Literal[3, 2, 4]):
+    if left == right:
+        reveal_type(left)  # revealed: Literal[2, 3]
+        reveal_type(right)  # revealed: Literal[3, 2]
+
+def _(left: Literal[b"a", b"b", 0], right: Literal[0, b"b", b"c"]):
+    if left == right:
+        reveal_type(left)  # revealed: Literal[b"b", 0]
+        reveal_type(right)  # revealed: Literal[0, b"b"]
 ```
 
 ## `==` with PEP 695 alias to a union of literals
@@ -2399,6 +2443,17 @@ def _(b: bool, i: Literal[1, 2]):
         reveal_type(i)  # revealed: Literal[1]
     else:
         reveal_type(i)  # revealed: Literal[2]
+```
+
+When two literal unions can compare equal because `True == 1`, each operand narrows to its own
+literal.
+
+```py
+def _(left: Literal[1, 2], right: Literal[True, 3]):
+    reveal_type(left == right)  # revealed: bool
+    if left == right:
+        reveal_type(left)  # revealed: Literal[1]
+        reveal_type(right)  # revealed: Literal[True]
 ```
 
 ## Integers and booleans with non-strict equality semantics

@@ -1494,7 +1494,7 @@ class TwoTag(TypedDict):
 def equal_dictionary_tags(value: FalseTag | TwoTag, other: T):
     if value["tag"] == other:
         reveal_type(value)  # revealed: FalseTag | TwoTag
-        value["two_only"]  # error: [invalid-key] "Unknown key "two_only" for TypedDict `FalseTag`"
+        value["two_only"]  # error: [invalid-typed-dict-key] "Unknown key "two_only" for TypedDict `FalseTag`"
 ```
 
 ## Constraints containing `Any`
@@ -2442,6 +2442,33 @@ def check(box: Box[int | str], value: int):
     reveal_type(provide(box, value))  # revealed: Box[str]
 ```
 
+## Declared type matching multiple type variables
+
+Regression test for <https://github.com/astral-sh/ty/issues/3236>.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Never, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V", default=Never)
+
+def concat(left: list[T], right: list[U]) -> list[T | U]:
+    return [*left, *right]
+
+def concat_wider(left: list[T], right: list[U]) -> list[T | U | V]:
+    return [*left, *right]
+
+def _(left: list[int], right: list[str]):
+    result: list[int | str] = concat(left, right)  # ok
+    wider: list[int | str | bytes] = concat_wider(left, right)  # ok
+```
+
 ## Inferring nested generic function calls
 
 We can infer type assignments in nested calls to multiple generic functions. If they use the same
@@ -2525,16 +2552,16 @@ from typing import Any, Callable, Generic, TypeVar
 F = TypeVar("F", bound=Callable[..., Any])
 
 def my_decorator(f: F) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever = 1
 
 class Box(Generic[F]):
     cls: type[F]
 
 def specialized(box: Box[Callable[..., Any]]) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     box.cls.whatever
 ```
 
@@ -4302,8 +4329,8 @@ def _(unknown, any_: Any) -> None:
     reveal_type(unknown_result)  # revealed: Literal[1] | str
     # TODO: revealed: Literal[1] | (Any & str)
     reveal_type(any_result)  # revealed: Literal[1] | str
-    unknown_result.bit_length()  # error: [unresolved-attribute]
-    any_result.bit_length()  # error: [unresolved-attribute]
+    unknown_result.bit_length()  # error: [missing-union-attribute]
+    any_result.bit_length()  # error: [missing-union-attribute]
 ```
 
 Gradual specializations inherited through concrete subclasses can satisfy bounds and constraints

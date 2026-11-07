@@ -144,7 +144,7 @@ result = extract(identity)
 # revealed: str | int
 reveal_type(result)
 
-# error: [unresolved-attribute] "Object of type `str | int` has no attribute `nonexistent`"
+# error: [missing-attribute] "Object of type `str | int` has no attribute `nonexistent`"
 result.nonexistent()
 ```
 
@@ -582,13 +582,13 @@ invariant_callback = InvariantCallback(original)
 invariant_remaining = invariant_tail(invariant_callback)  # error: [invalid-argument-type]
 reveal_type(invariant_remaining)  # revealed: (value: str) -> int
 invariant_remaining(1)  # error: [invalid-argument-type]
-invariant_remaining("valid").missing_attribute  # error: [unresolved-attribute]
+invariant_remaining("valid").missing_attribute  # error: [missing-attribute]
 
 contravariant_callback = ContravariantCallback(original)
 contravariant_remaining = contravariant_tail(contravariant_callback)  # error: [invalid-argument-type]
 reveal_type(contravariant_remaining)  # revealed: (value: str) -> int
 contravariant_remaining(1)  # error: [invalid-argument-type]
-contravariant_remaining("valid").missing_attribute  # error: [unresolved-attribute]
+contravariant_remaining("valid").missing_attribute  # error: [missing-attribute]
 ```
 
 A higher-order callback must retain its inferred parameter list under both outer variances, even
@@ -1045,8 +1045,8 @@ def _(unknown, any_: Any) -> None:
     reveal_type(unknown_result)  # revealed: Literal[1] | str
     # TODO: revealed: Literal[1] | (Any & str)
     reveal_type(any_result)  # revealed: Literal[1] | str
-    unknown_result.bit_length()  # error: [unresolved-attribute]
-    any_result.bit_length()  # error: [unresolved-attribute]
+    unknown_result.bit_length()  # error: [missing-union-attribute]
+    any_result.bit_length()  # error: [missing-union-attribute]
 ```
 
 Gradual specializations inherited through concrete subclasses can satisfy bounds and constraints
@@ -2925,7 +2925,7 @@ class TwoTag(TypedDict):
 def equal_dictionary_tags[T: (Literal[0], Literal[2])](value: FalseTag | TwoTag, other: T):
     if value["tag"] == other:
         reveal_type(value)  # revealed: FalseTag | TwoTag
-        value["two_only"]  # error: [invalid-key] "Unknown key "two_only" for TypedDict `FalseTag`"
+        value["two_only"]  # error: [invalid-typed-dict-key] "Unknown key "two_only" for TypedDict `FalseTag`"
 ```
 
 ## Fixed-length starred parameters on generic methods
@@ -3598,6 +3598,29 @@ def check(box: Box[int | str], value: int):
     reveal_type(provide(box, value))  # revealed: Box[str]
 ```
 
+## Declared type matching multiple type variables
+
+Regression test for <https://github.com/astral-sh/ty/issues/3236>.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Never
+
+def concat[T, U](left: list[T], right: list[U]) -> list[T | U]:
+    return [*left, *right]
+
+def concat_wider[T, U, V = Never](left: list[T], right: list[U]) -> list[T | U | V]:
+    return [*left, *right]
+
+def _(left: list[int], right: list[str]):
+    result: list[int | str] = concat(left, right)  # ok
+    wider: list[int | str | bytes] = concat_wider(left, right)  # ok
+```
+
 ## Inferring nested generic function calls
 
 We can infer type assignments in nested calls to multiple generic functions. If they use the same
@@ -3832,16 +3855,16 @@ def decorated[T](t: T) -> None:
 from typing import Any, Callable
 
 def my_decorator[T: Callable[..., Any]](f: T) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever = 1
 
 class Box[T: Callable[..., Any]]:
     cls: type[T]
 
 def specialized(box: Box[Callable[..., Any]]) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     box.cls.whatever
 ```
 
