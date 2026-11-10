@@ -50,6 +50,7 @@ use crate::reachability::{
 };
 use crate::types::abstract_methods::AbstractMethods;
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
+use crate::types::annotation_target::{is_valid_annotation_target, receiver_method_scope};
 use crate::types::attribute_write::{AssignmentAttributeMembers, assignment_attribute_members};
 use crate::types::call::bind::{
     ArgumentContextSpecialization, ArgumentTypeContext, CallableDescription, CheckTypesMode,
@@ -64,16 +65,16 @@ use crate::types::constraints::{CandidateSolutions, ConstraintSetBuilder, Soluti
 use crate::types::context::{InferContext, InferContextResult};
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
-    self, CALL_NON_CALLABLE, CONFLICTING_DECLARATIONS, CYCLIC_TYPE_ALIAS_DEFINITION,
-    DYNAMIC_FUNCTION_DECORATOR_RETURN, GeneratorMismatchKind, INEFFECTIVE_FINAL,
-    INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, INVALID_DECLARATION,
-    INVALID_ENUM_MEMBER_ANNOTATION, INVALID_LEGACY_TYPE_VARIABLE, INVALID_NEWTYPE,
-    INVALID_PARAMSPEC, INVALID_TYPE_ALIAS_TYPE, INVALID_TYPE_FORM, INVALID_TYPE_VARIABLE_BOUND,
-    INVALID_TYPE_VARIABLE_CONSTRAINTS, INVALID_TYPE_VARIABLE_DEFAULT, MISMATCHED_SENTINEL_NAME,
-    MISSING_ATTRIBUTE, MISSING_UNION_ATTRIBUTE, POSSIBLY_MISSING_IMPLICIT_CALL,
-    POSSIBLY_MISSING_SUBMODULE, UNRESOLVED_GLOBAL, UNRESOLVED_REFERENCE, UNSOUND_ASSIGNMENT,
-    UNSOUND_YIELD, UNSUPPORTED_OPERATOR, YieldKind, autofix_with_notimplementederror,
-    hint_if_stdlib_attribute_exists_on_other_versions,
+    self, ABSTRACT_CLASS_INSTANTIATION, CALL_NON_CALLABLE, CONFLICTING_DECLARATIONS,
+    CYCLIC_TYPE_ALIAS_DEFINITION, DYNAMIC_FUNCTION_DECORATOR_RETURN, GeneratorMismatchKind,
+    INEFFECTIVE_FINAL, INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS,
+    INVALID_DECLARATION, INVALID_ENUM_MEMBER_ANNOTATION, INVALID_LEGACY_TYPE_VARIABLE,
+    INVALID_NEWTYPE, INVALID_PARAMSPEC, INVALID_TYPE_ALIAS_TYPE, INVALID_TYPE_FORM,
+    INVALID_TYPE_VARIABLE_BOUND, INVALID_TYPE_VARIABLE_CONSTRAINTS, INVALID_TYPE_VARIABLE_DEFAULT,
+    MISMATCHED_SENTINEL_NAME, MISSING_ATTRIBUTE, MISSING_UNION_ATTRIBUTE,
+    POSSIBLY_MISSING_IMPLICIT_CALL, POSSIBLY_MISSING_SUBMODULE, UNRESOLVED_GLOBAL,
+    UNRESOLVED_REFERENCE, UNSOUND_ASSIGNMENT, UNSOUND_YIELD, UNSUPPORTED_OPERATOR, YieldKind,
+    autofix_with_notimplementederror, hint_if_stdlib_attribute_exists_on_other_versions,
     report_attempted_instantiation_of_abstract_class, report_attempted_protocol_instantiation,
     report_bad_dunder_delattr_call, report_bad_dunder_delete_call, report_call_to_abstract_method,
     report_cannot_pop_required_field_on_typed_dict, report_dynamic_function_decorator_return,
@@ -2146,7 +2147,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Some(receiver) = target.value.as_name_expr() else {
             return;
         };
-        let Some(method_scope_id) = self.receiver_method_scope(receiver) else {
+        let Some(method_scope_id) = receiver_method_scope(db, self.index, self.scope(), receiver)
+        else {
             return;
         };
         let Some(protocol) = self
@@ -4438,12 +4440,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    fn is_valid_receiver_annotation_target(&self, target: &ast::Expr) -> bool {
-        target
-            .as_attribute_expr()
-            .is_some_and(|target| self.is_receiver_attribute_annotation_target(target))
-    }
-
     fn infer_annotated_assignment_statement(&mut self, assignment: &ast::StmtAnnAssign) {
         let db = self.db();
         let env = self.program_environment();
@@ -4529,7 +4525,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // Disallow annotations on non-name targets unless they are valid receivers (e.g.
             // `self.x: int` or `cls.x: int`).
-            if !self.is_valid_receiver_annotation_target(target) {
+            if !is_valid_annotation_target(db, self.program_file(), target) {
                 let message = match target.as_ref() {
                     ast::Expr::Attribute(_) => {
                         "Type annotations are not allowed on this attribute expression"
@@ -4679,7 +4675,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let target = assignment.target(self.module());
         let value = assignment.value(self.module());
 
-        if !target.is_name_expr() && !self.is_valid_receiver_annotation_target(target) {
+        if !is_valid_annotation_target(db, self.program_file(), target) {
             // Omit this definition from `self.declarations`; declaration lookup treats an absent
             // inferred declaration as rejected.
             if !definition
@@ -10002,14 +9998,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // that protocol -- and indeed, according to the spec, type checkers must disallow abstract
             // subclasses of the protocol to be passed to parameters that accept `type[SomeProtocol]`.
             // <https://typing.python.org/en/latest/spec/protocol.html#type-and-class-objects-vs-protocols>.
-            if !callable_type.is_subclass_of() {
+            if !callable_type.is_subclass_of()
+                && self.context.is_lint_enabled(&ABSTRACT_CLASS_INSTANTIATION)
+            {
                 if let Some(protocol) = class.into_protocol_class(db) {
                     report_attempted_protocol_instantiation(
                         &self.context,
                         call_expression,
                         protocol,
                     );
-                } else if self.context.is_lint_enabled(&CALL_NON_CALLABLE) {
+                } else {
                     let abstract_methods = AbstractMethods::of_class(db, class);
                     if !abstract_methods.is_empty() {
                         report_attempted_instantiation_of_abstract_class(
