@@ -506,6 +506,45 @@ Example("example")
 Example(123)  # error: [invalid-argument-type] "Expected `str`, found `Literal[123]`"
 ```
 
+## Inherited annotations depend on the result of overload resolution
+
+Looking up `kind` to select a decorator overload requires resolving the bases, which refer back to
+the decorated class. Since `kind` is `int`, the second overload applies and `Child.Item` resolves to
+the type alias on `Result`.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```pyi
+from typing import NamedTuple, Protocol, overload
+
+class Result:
+    type Item = int
+
+class HasStrKind(Protocol):
+    kind: type[str] | None
+
+class Base:
+    kind: type["Child.Item"] | None
+
+class Record(NamedTuple):
+    item: "Child.Item"
+
+@overload
+def choose[T: HasStrKind](cls: type[T]) -> type[T]: ...
+@overload
+def choose(cls: type[Base]) -> type[Result]: ...
+
+@choose
+class Child(Base, Record):
+    kind = int
+    Item = kind
+
+reveal_type(Child)  # revealed: type[Result]
+```
+
 ## Dataclass outside a decorator whose annotations depend on the class
 
 An outer `@dataclass` still generates an initializer when the inner decorator's annotations depend
@@ -813,4 +852,40 @@ def check(flag: bool):
         state = (frozenset((items,)).copy, items, state)
         size: Literal[1] = len(state[1])
         state[1].append(42)  # error: [missing-attribute]
+```
+
+## A decorator whose inferred return type changes during cycle recovery
+
+The decorator's overload depends on `Child.item`, whose inherited type depends in turn on the
+decorated `Child`. Even if we widen the public binding to include both overload results, the class
+body still needs the original class to infer `self`.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Any, Protocol, overload
+
+class HasItem(Protocol):
+    item: type[str]
+
+@overload
+def wrap[T: HasItem](cls: type[T]) -> type[T]: ...
+@overload
+def wrap(cls: type) -> type[Any]: ...
+def wrap(cls: type) -> type:
+    return cls
+
+class Base[T = "Child.Item"]:
+    item: type[T]
+
+@wrap
+class Child(Base):
+    item = str
+    Item = item
+
+    def read(self):
+        reveal_type(self)  # revealed: Self@read
 ```

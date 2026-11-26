@@ -1204,6 +1204,9 @@ impl<'db> UnionBuilder<'db> {
             (Type::Divergent(left), Type::Divergent(right)) => {
                 left.materialization_kind().is_none() && right.materialization_kind().is_none()
             }
+            (Type::Callable(left), Type::Callable(right)) => left
+                .signatures(db)
+                .has_incomparable_parameters(right.signatures(db)),
             (Type::ClassLiteral(_), Type::ClassLiteral(_))
             | (Type::ModuleLiteral(_), Type::ModuleLiteral(_)) => true,
             // Distributing `Any & Literal["a", "b"]` produces one intersection per
@@ -1271,6 +1274,7 @@ impl<'db> UnionBuilder<'db> {
         // unpacking them.
         let should_simplify_full = !ty.is_alias_like() && !self.cycle_recovery;
 
+        let mut incoming_tuple = None;
         let mut ty_negated: Option<Type> = None;
         let mut reductions = UnionReductions::default();
 
@@ -1383,15 +1387,24 @@ impl<'db> UnionBuilder<'db> {
                     continue;
                 }
 
-                // Disjoint leading literals distinguish tagged tuples. Only inspect
-                // the tags when we would otherwise check both directions for redundancy.
-                if let Some(left) = ty.exact_tuple_instance_spec(db)
+                // If two fixed-length tuples have disjoint literals or distinct class objects
+                // at the same position, neither can subsume the other.
+                if let Some(left) =
+                    incoming_tuple.get_or_insert_with(|| ty.exact_tuple_instance_spec(db))
                     && let Some(left) = left.as_fixed_length()
-                    && let Some(Type::LiteralValue(tag)) = left.elements_slice().first()
                     && let Some(right) = element_type.exact_tuple_instance_spec(db)
                     && let Some(right) = right.as_fixed_length()
-                    && let Some(Type::LiteralValue(other)) = right.elements_slice().first()
-                    && tag.is_disjoint_from(db, *other)
+                    && left
+                        .elements_slice()
+                        .iter()
+                        .zip(right.elements_slice())
+                        .any(|(a, b)| match (a, b) {
+                            (Type::LiteralValue(a), Type::LiteralValue(b)) => {
+                                a.is_disjoint_from(db, *b)
+                            }
+                            (Type::ClassLiteral(a), Type::ClassLiteral(b)) => a != b,
+                            _ => false,
+                        })
                 {
                     continue;
                 }
@@ -3066,6 +3079,31 @@ mod tests {
                 assert!(union.elements(db).contains(&left));
                 assert!(union.elements(db).contains(&right));
             }
+        }
+    }
+
+    #[test]
+    fn cycle_recovery_deduplicates_structurally_substituted_instances() {
+        let db = setup_db();
+        let env = db.program_environment();
+        let mut elements: Vec<_> = (0..8)
+            .map(|i| Type::heterogeneous_tuple(&db, &env, [Type::int_literal(i)]))
+            .collect();
+        let expected = UnionType::from_elements_cycle_recovery(&db, &env, elements.iter().copied());
+
+        // Structural substitutions can construct a union without going through the builder.
+        elements.push(elements[0]);
+        let duplicate = UnionType::new(&db, elements.into_boxed_slice(), RecursivelyDefined::No);
+        for union in [expected.expect_union(), duplicate] {
+            assert_eq!(
+                Type::Union(union).recursive_type_normalized_impl(
+                    &db,
+                    &env,
+                    Type::pending_narrowing(),
+                    true
+                ),
+                Some(expected)
+            );
         }
     }
 

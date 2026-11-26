@@ -9,6 +9,7 @@ use std::sync::Arc;
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 
 use ruff_index::{FrozenIndexVec, IndexSlice};
+use ruff_python_ast::name::Name;
 use ruff_python_ast::{HasNodeIndex, NodeIndex};
 use ruff_python_parser::semantic_errors::SemanticSyntaxError;
 use ruff_text_size::{Ranged, TextRange};
@@ -25,6 +26,7 @@ pub use ast_ids::ExpressionNodeKey;
 use builder::SemanticIndexBuilder;
 use definition::{Definition, DefinitionNodeKey, Definitions};
 use expression::Expression;
+use member::ScopedMemberId;
 use narrowing_constraints::ScopedNarrowingConstraint;
 pub use place::{PlaceExprRef, PlaceTable};
 pub use reachability_constraints::ReachabilityConstraintsBuilder;
@@ -33,9 +35,9 @@ use scope::{NodeWithScopeKey, NodeWithScopeRef, Scope, ScopeId, ScopeKind, Scope
 use symbol::ScopedSymbolId;
 pub use use_def::{
     ApplicableConstraints, BindingWithConstraints, BindingWithConstraintsIterator,
-    BindingsSnapshotId, DeclarationWithConstraint, DeclarationsIterator, ImportedFinalCandidate,
-    ImportedFinalCandidatesIterator, LiveBinding, LoopHeaderId, NarrowingEvaluator,
-    PredicateNarrowingTargets, ScopedDefinitionId, UseDefMap,
+    BindingsSnapshotId, DeclarationSources, DeclarationWithConstraint, DeclarationsIterator,
+    ImportedFinalCandidate, ImportedFinalCandidatesIterator, LiveBinding, LoopHeaderId,
+    NarrowingEvaluator, PredicateNarrowingTargets, ScopedDefinitionId, UseDefMap,
 };
 use use_def::{EnclosingSnapshotKey, ScopedEnclosingSnapshotId};
 
@@ -224,6 +226,42 @@ pub fn attribute_scopes<'db>(
             });
             once(func_id).chain(nested)
         })
+}
+
+/// Receiver attributes in method scopes, grouped by name in scope traversal order.
+#[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
+fn receiver_attribute_locations<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+) -> Box<[(Name, FileScopeId, ScopedMemberId)]> {
+    let index = semantic_index(db, scope.program_file(db));
+    let mut locations = Vec::new();
+    for method in attribute_scopes(db, scope) {
+        for (id, member) in index.place_table(method).members().enumerate() {
+            if let Some(name) = member.as_instance_attribute() {
+                locations.push((Name::new(name), method, ScopedMemberId::from_usize(id)));
+            }
+        }
+    }
+    // Keep the same order as scanning the methods and taking the first matching
+    // member in each scope.
+    locations.sort_by(|a, b| a.0.cmp(&b.0));
+    locations.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    locations.into_boxed_slice()
+}
+
+/// Returns the first matching receiver member in each method scope that uses this name.
+pub fn receiver_attribute_places<'db, 's>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    name: &'s str,
+) -> impl Iterator<Item = (FileScopeId, ScopedMemberId)> + use<'s, 'db> {
+    let locations = receiver_attribute_locations(db, scope);
+    let start = locations.partition_point(|(candidate, _, _)| candidate.as_str() < name);
+    locations[start..]
+        .iter()
+        .take_while(move |(candidate, _, _)| candidate.as_str() == name)
+        .map(|&(_, method, member)| (method, member))
 }
 
 /// Returns the module global scope of `file`.
@@ -1406,15 +1444,16 @@ mod tests {
                     DefinitionKind::AnnotatedAssignment(_)
                 );
             }
+            let sources = use_def.declaration_sources_at_binding(assignment).unwrap();
             assert_eq!(
-                use_def
-                    .declarations_at_binding(assignment)
+                sources
+                    .declarations()
                     .map(|declaration| declaration.declaration)
                     .collect::<Vec<_>>(),
                 [declaration.map_or(DefinitionState::Undefined, DefinitionState::Defined)]
             );
 
-            let mut candidates = use_def.imported_final_candidates_at_binding(assignment);
+            let mut candidates = sources.imported_final_candidates();
             assert_matches!(
                 candidates
                     .next()
@@ -1443,6 +1482,7 @@ mod tests {
             .first_public_binding(global_table.symbol_id("x").expect("symbol exists"))
             .unwrap();
         assert_matches!(binding.kind(&db), DefinitionKind::Assignment(_));
+        assert!(use_def.declaration_sources_at_binding(binding).is_none());
     }
 
     #[test]

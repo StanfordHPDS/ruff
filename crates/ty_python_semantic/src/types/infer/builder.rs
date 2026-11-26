@@ -38,8 +38,8 @@ use crate::diagnostic::format_enumeration;
 use crate::place::{
     DefinedPlace, Definedness, LookupError, Place, PlaceAndQualifiers, TypeOrigin,
     loop_header_reachability, module_type_implicit_global_declaration,
-    module_type_implicit_global_symbol, place_from_bindings_with_reachability_cache,
-    place_from_declarations_with_reachability_cache,
+    module_type_implicit_global_symbol, place_from_binding_declarations,
+    place_from_bindings_with_reachability_cache,
 };
 use crate::place_load::{
     ConstraintKeys, ImplicitPlaceLoad, PlaceLoadMode, PlaceLoadResolver, PlaceLoadSourceKind,
@@ -105,6 +105,7 @@ use crate::types::generics::{
 use crate::types::infer::builder::binary_expressions::{
     BinaryInferenceState, has_in_place_operator,
 };
+use crate::types::infer::builder::expression_map::ExpressionMap;
 use crate::types::infer::builder::named_tuple::NamedTupleKind;
 use crate::types::infer::builder::paramspec_validation::validate_paramspec_components;
 use crate::types::infer::{
@@ -181,6 +182,7 @@ mod class;
 mod dict;
 mod dynamic_class;
 mod enum_call;
+mod expression_map;
 mod final_attribute;
 mod function;
 mod imports;
@@ -314,7 +316,7 @@ pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     region: InferenceRegion<'db>,
 
     /// The types of every expression in this region.
-    expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
+    expressions: ExpressionMap<'db>,
 
     /// Truthiness overrides for evaluating comparison chains directly as conditions.
     /// See [`ExpressionInferenceExtra::comparison_truthiness`] for why these are stored
@@ -632,7 +634,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             called_functions: FxIndexSet::default(),
             legacy_aliases: FxIndexSet::default(),
             deferred_state: DeferredExpressionState::None,
-            expressions: FxHashMap::default(),
+            expressions: ExpressionMap::default(),
             comparison_truthiness: FxHashMap::default(),
             expression_cache: None,
             reachability_cache: OnceCell::new(),
@@ -719,7 +721,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         #[cfg(debug_assertions)]
         assert_eq!(self.scope, inference.scope);
 
-        self.extend_expression_types(inference.expressions.iter().copied());
+        self.extend_sorted(inference.expressions.iter().as_slice());
         self.declarations.extend(inference.declarations(definition));
 
         if self.region.collects_bindings() {
@@ -808,7 +810,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         #[cfg(debug_assertions)]
         assert_eq!(self.scope, inference.scope);
 
-        self.extend_expression_types(inference.expressions.iter().copied());
+        self.extend_sorted(inference.expressions.iter().as_slice());
         self.declarations.extend(inference.declarations());
 
         if self.region.collects_bindings() {
@@ -856,6 +858,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
+    /// Merge a frozen region's entries, which have unique keys in ascending order.
+    ///
+    /// Append a disjoint range directly when no truthiness overrides need clearing.
+    fn extend_sorted(&mut self, entries: &[(ExpressionNodeKey, Type<'db>)]) {
+        if self.comparison_truthiness.is_empty() {
+            self.expressions.extend_sorted(entries);
+        } else {
+            self.extend_expression_types(entries.iter().copied());
+        }
+    }
+
     /// Replacing an expression's type also replaces any truthiness override. A newly inferred
     /// comparison may no longer need an override, so extending the sparse map alone is not enough.
     fn extend_expression_types(
@@ -874,7 +887,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     /// Merges expression results without claiming bindings owned by their enclosing statement.
     fn extend_expression_without_bindings(&mut self, inference: &ExpressionInference<'db>) {
-        self.extend_expression_types(inference.expressions.iter().copied());
+        self.extend_sorted(inference.expressions.iter().as_slice());
 
         if let Some(extra) = &inference.extra {
             self.legacy_aliases
@@ -911,7 +924,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         #[cfg(debug_assertions)]
         assert_eq!(self.scope, inference.scope);
 
-        self.extend_expression_types(inference.expressions.iter().map(|(key, ty)| (*key, *ty)));
+        self.extend_expression_types(inference.expressions.iter());
         self.comparison_truthiness.extend(
             inference
                 .comparison_truthiness
@@ -1151,7 +1164,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn try_expression_type(&self, expr: &ast::Expr) -> Option<Type<'db>> {
         self.expressions
-            .get(&expr.into())
+            .get(expr.into())
             .copied()
             .or(self.fallback_type())
     }
@@ -1636,10 +1649,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    /// Add a binding for the given definition.
-    ///
-    /// Returns the result of the `infer_value_ty` closure, which is called with the declared type
-    /// as type context.
+    /// Resolve the declarations that guide inference of the value. Once inferred, pass its
+    /// type to [`AddBinding::insert`] to check the assignment and record the binding.
     fn add_binding<'a>(
         &mut self,
         node: AnyNodeRef<'a>,
@@ -1653,77 +1664,39 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .is_binding()
         );
 
-        let db = self.db();
         let file_scope_id = binding.file_scope(db);
         let place_table = self.index.place_table(file_scope_id);
         let use_def = self.index.use_def_map(file_scope_id);
-
-        let place_id = binding.place(self.db());
+        let place_id = binding.place(db);
         let place = place_table.place(place_id);
-
-        let (declarations, imported_final_candidates, is_local) = if let Some(symbol) =
-            place_id.as_symbol()
-            && let Some((owner_scope, owner_symbol)) =
-                self.forwarded_assignment_owner(file_scope_id, symbol)
-        {
-            let owner_use_def = self.index.use_def_map(owner_scope);
-            (
-                owner_use_def.end_of_scope_symbol_declarations(owner_symbol),
-                owner_use_def.end_of_scope_imported_final_candidates(owner_symbol.into()),
-                false,
-            )
+        let env = self.program_environment();
+        let owner = place_id
+            .as_symbol()
+            .and_then(|symbol| self.forwarded_assignment_owner(file_scope_id, symbol));
+        let is_local = owner.is_none();
+        let is_import = binding.kind(db).is_import();
+        let resolve = |sources| {
+            place_from_binding_declarations(db, env, sources, is_import, self.reachability_cache())
+        };
+        let declared = if let Some((scope, symbol)) = owner {
+            let mut declared = resolve(
+                self.index
+                    .use_def_map(scope)
+                    .end_of_scope_declaration_sources(symbol.into()),
+            );
+            if !is_import && let Some(local) = use_def.declaration_sources_at_binding(binding) {
+                declared = declared.with_forwarding_scope(&resolve(local));
+            }
+            declared
         } else {
-            (
-                use_def.declarations_at_binding(binding),
-                use_def.imported_final_candidates_at_binding(binding),
-                true,
-            )
+            use_def
+                .declaration_sources_at_binding(binding)
+                .map_or_default(resolve)
         };
 
-        let env = self.program_environment();
-        let is_import = binding.kind(db).is_import();
-        let mut declared = place_from_declarations_with_reachability_cache(
-            db,
-            env,
-            declarations,
-            self.reachability_cache(),
-        );
-        let mut has_final_declaration = declared.qualifiers().contains(TypeQualifiers::FINAL);
-        if !is_import {
-            declared = declared.with_imported_final_for_assignment(
-                db,
-                env,
-                imported_final_candidates,
-                self.reachability_cache(),
-            );
-        }
-        let mut qualifier_only = declared.is_qualifier_only();
+        let has_final_declaration = declared.has_final_declaration();
+        let qualifier_only = declared.is_qualifier_only();
         let (mut place_and_quals, conflicting) = declared.into_place_and_conflicting_declarations();
-
-        // Imports into `global` and `nonlocal` names retain their qualifiers in the forwarding
-        // scope, while the owner's declarations continue to supply the declared type.
-        if !is_local && !is_import {
-            let local_declared = place_from_declarations_with_reachability_cache(
-                db,
-                env,
-                use_def.declarations_at_binding(binding),
-                self.reachability_cache(),
-            );
-            has_final_declaration |= local_declared.qualifiers().contains(TypeQualifiers::FINAL);
-            let local_declared = local_declared.with_imported_final_for_assignment(
-                db,
-                env,
-                use_def.imported_final_candidates_at_binding(binding),
-                self.reachability_cache(),
-            );
-            let local_place = local_declared.ignore_conflicting_declarations();
-
-            place_and_quals.qualifiers |= local_place.qualifiers;
-            if place_and_quals.place.is_undefined() {
-                place_and_quals.place = local_place.place;
-                qualifier_only = local_declared.is_qualifier_only();
-            }
-        }
 
         if let Some(conflicting) = conflicting {
             // TODO point out the conflicting declarations in the diagnostic?
@@ -12781,7 +12754,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         StatementInferenceInner {
-            expressions: FrozenMap::from(expressions),
+            expressions: expressions.freeze(),
             #[cfg(debug_assertions)]
             scope,
             bindings: bindings.into_boxed_slice(),
@@ -12854,7 +12827,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         FunctionDecoratorInference {
             legacy_aliases: legacy_aliases.into_iter().collect(),
             deferred_name_loads: FrozenSet::from(deferred_name_loads),
-            expression_types: FrozenMap::from(expressions),
+            expression_types: expressions.freeze(),
             bindings: bindings.into_boxed_slice(),
             called_functions: called_functions
                 .into_iter()
@@ -13016,7 +12989,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         DefinitionInference {
-            expressions: FrozenMap::from(expressions),
+            expressions: expressions.freeze(),
             #[cfg(debug_assertions)]
             scope,
             types: DefinitionTypes::from_parts(
@@ -13147,7 +13120,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         });
 
         ScopeInference {
-            expressions: FrozenValueMap::from(expressions),
+            expressions: FrozenValueMap::from_sorted(expressions.into_sorted()),
             extra,
         }
     }
@@ -13288,7 +13261,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             "speculative `TypeInferenceBuilder` should only be used for expression inference"
         );
 
-        self.extend_expression_types(expressions);
+        self.extend_expression_types(expressions.freeze().iter().copied());
         self.comparison_truthiness.extend(comparison_truthiness);
         self.context.extend(&context);
         self.extend_cycle_recovery(cycle_recovery);
@@ -13418,7 +13391,7 @@ enum ExpressionCacheEntry<'db> {
 /// that is otherwise performed for Salsa results.
 struct FullExpressionCacheEntry<'db> {
     legacy_aliases: FxIndexSet<Definition<'db>>,
-    expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
+    expressions: ExpressionMap<'db>,
     comparison_truthiness: FxHashMap<ExpressionNodeKey, Truthiness>,
     type_expression_flags: FxHashMap<ExpressionNodeKey, TypeExpressionFlags>,
     collection_use_constraints: CollectionUseConstraints<'db>,
@@ -13436,7 +13409,7 @@ struct FullExpressionCacheEntry<'db> {
 impl<'db> FullExpressionCacheEntry<'db> {
     fn expression_type(&self, expression: ExpressionNodeKey) -> Type<'db> {
         self.expressions
-            .get(&expression)
+            .get(expression)
             .copied()
             .or(self.cycle_recovery)
             .unwrap_or_else(Type::unknown)
@@ -13444,7 +13417,7 @@ impl<'db> FullExpressionCacheEntry<'db> {
 
     fn is_single_expression(&self, expression: ExpressionNodeKey, ty: Type<'db>) -> bool {
         self.expressions.len() == 1
-            && self.expressions.get(&expression) == Some(&ty)
+            && self.expressions.get(expression) == Some(&ty)
             && !self.has_extra()
     }
 
@@ -13494,7 +13467,7 @@ impl<'db> FullExpressionCacheEntry<'db> {
         });
 
         ExpressionInference {
-            expressions: FrozenMap::from(self.expressions),
+            expressions: self.expressions.freeze(),
             extra,
             #[cfg(debug_assertions)]
             scope: self.scope,
@@ -14036,19 +14009,14 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
         inferred_ty: Type<'db>,
     ) -> Type<'db> {
         let env = builder.program_environment();
-        let declared_ty = self
-            .type_context
-            .expected_type()
-            .unwrap_or_else(Type::unknown);
-
+        let declared_ty = self.type_context.expected_type();
         let db = builder.db();
-        let file_scope_id = self.binding.file_scope(db);
-        let use_def = builder.index.use_def_map(file_scope_id);
-        let place_table = builder.index.place_table(file_scope_id);
 
         let mut bound_ty = inferred_ty;
 
         if self.qualifiers.contains(TypeQualifiers::FINAL) {
+            let file_scope_id = self.binding.file_scope(db);
+            let use_def = builder.index.use_def_map(file_scope_id);
             let mut previous_bindings = use_def.bindings_at_definition(self.binding);
 
             // An assignment to a local `Final`-qualified symbol is only an error if there are prior bindings
@@ -14056,7 +14024,10 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
             let previous_definition = previous_bindings.find_map(|r| r.binding.definition());
 
             if !self.is_local || previous_definition.is_some() {
-                let place = place_table.place(self.binding.place(db));
+                let place = builder
+                    .index
+                    .place_table(file_scope_id)
+                    .place(self.binding.place(db));
                 if let Some(diag_builder) = builder.context.report_lint(
                     &INVALID_ASSIGNMENT,
                     self.binding.full_range(builder.db(), builder.module()),
@@ -14092,13 +14063,15 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
             }
         }
 
-        if !builder.validate_assignment_type(
-            self.node,
-            self.binding,
-            AssignmentDeclaration::Ordinary(self.declaration),
-            declared_ty,
-            bound_ty,
-        ) {
+        if let Some(declared_ty) = declared_ty
+            && !builder.validate_assignment_type(
+                self.node,
+                self.binding,
+                AssignmentDeclaration::Ordinary(self.declaration),
+                declared_ty,
+                bound_ty,
+            )
+        {
             builder.discard_dict_key_assignments_for(self.binding);
 
             // Allow declarations to override inference in case of invalid assignment.
@@ -14154,7 +14127,7 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
                     })
             {
                 builder.discard_dict_key_assignments_for(self.binding);
-                bound_ty = declared_ty;
+                bound_ty = declared_ty.unwrap_or_else(Type::unknown);
             }
         } else if let AnyNodeRef::ExprSubscript(ast::ExprSubscript { value, .. }) = self.node {
             let value_ty = builder
@@ -14163,7 +14136,7 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
 
             if !value_ty.is_typed_dict() && !Self::is_safe_mutable_class(db, env, value_ty) {
                 builder.discard_dict_key_assignments_for(self.binding);
-                bound_ty = declared_ty;
+                bound_ty = declared_ty.unwrap_or_else(Type::unknown);
             }
         }
 
