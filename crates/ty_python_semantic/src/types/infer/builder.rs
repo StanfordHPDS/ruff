@@ -1331,11 +1331,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             "Inferring deferred types should not add more deferred definitions"
         );
 
-        if self.db().should_check_file(self.file()) {
+        if self.context.should_check_file() {
             let mut seen_overloaded_places = FxHashSet::default();
             let mut seen_public_functions = FxHashSet::default();
 
+            let mut has_final_declaration = false;
             for (&definition, ty_and_quals) in &self.declarations {
+                // A bare `Final` declaration has a qualifier but no inner type.
+                has_final_declaration |= ty_and_quals.qualifiers().contains(TypeQualifiers::FINAL);
                 let Some(ty) = ty_and_quals.inner_type() else {
                     continue;
                 };
@@ -1417,7 +1420,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
 
-            post_inference::final_variable::check_final_without_value(&self.context, self.index);
+            if has_final_declaration {
+                post_inference::final_variable::check_final_without_value(
+                    &self.context,
+                    self.index,
+                );
+            }
         }
     }
 
@@ -11441,6 +11449,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.db(),
             self.program_environment(),
             self.index,
+            self.program_file(),
             self.scope(),
             source_place.place(),
             mode,
